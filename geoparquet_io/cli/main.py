@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from importlib.metadata import entry_points
 from pathlib import Path
 
@@ -110,6 +111,24 @@ class OptionalIntCommand(GlobAwareCommand):
                     # Option at end of args
                     args.insert(idx + 1, str(default_val))
         return super().make_context(info_name, args, parent=parent, **extra)
+
+
+@contextmanager
+def _activate_s3(ctx, aws_profile=None, s3_endpoint=None, s3_region=None, s3_no_ssl=False):
+    """Resolve and activate S3 config from ctx + per-command overrides."""
+    from geoparquet_io.core.duckdb_utils import s3_config_scope
+    from geoparquet_io.core.remote import resolve_s3_config
+
+    config = resolve_s3_config(
+        s3_endpoint=s3_endpoint or ctx.obj.get("s3_endpoint"),
+        s3_region=s3_region or ctx.obj.get("s3_region"),
+        s3_no_ssl=s3_no_ssl or ctx.obj.get("s3_no_ssl", False),
+        aws_profile=aws_profile or ctx.obj.get("aws_profile"),
+    )
+    if config["profile"]:
+        os.environ["AWS_PROFILE"] = config["profile"]
+    with s3_config_scope(config):
+        yield config
 
 
 @with_plugins(entry_points(group="gpio.plugins"))
@@ -1132,7 +1151,9 @@ def convert(ctx):
 @aws_profile_option
 @any_extension_option
 @show_sql_option
+@click.pass_context
 def convert_to_geoparquet_cmd(
+    ctx,
     input_file,
     output_file,
     skip_hilbert,
@@ -1196,48 +1217,49 @@ def convert_to_geoparquet_cmd(
     row_group_mb = parse_row_group_options(row_group_size, row_group_size_mb)
 
     # Check for streaming output
-    if should_stream_output(output_file):
-        # Suppress verbose for streaming
-        verbose = False
-        _convert_streaming(
-            input_file,
-            skip_hilbert=skip_hilbert,
-            wkt_column=wkt_column,
-            lat_column=lat_column,
-            lon_column=lon_column,
-            delimiter=delimiter,
-            layer=layer,
-            crs=crs,
-            skip_invalid=skip_invalid,
-            allow_no_geometry=allow_no_geometry,
-            profile=aws_profile,
-            geoparquet_version=geoparquet_version,
-            compression=compression,
-            compression_level=compression_level,
-            row_group_rows=row_group_size,
-            row_group_size_mb=row_group_mb,
-        )
-    else:
-        convert_to_geoparquet(
-            input_file,
-            output_file,
-            skip_hilbert=skip_hilbert,
-            verbose=verbose,
-            compression=compression,
-            compression_level=compression_level,
-            row_group_rows=row_group_size,  # Pass through as-is (None if not specified)
-            row_group_size_mb=row_group_mb,
-            wkt_column=wkt_column,
-            lat_column=lat_column,
-            lon_column=lon_column,
-            delimiter=delimiter,
-            layer=layer,
-            crs=crs,
-            skip_invalid=skip_invalid,
-            allow_no_geometry=allow_no_geometry,
-            profile=aws_profile,
-            geoparquet_version=geoparquet_version,
-        )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        if should_stream_output(output_file):
+            # Suppress verbose for streaming
+            verbose = False
+            _convert_streaming(
+                input_file,
+                skip_hilbert=skip_hilbert,
+                wkt_column=wkt_column,
+                lat_column=lat_column,
+                lon_column=lon_column,
+                delimiter=delimiter,
+                layer=layer,
+                crs=crs,
+                skip_invalid=skip_invalid,
+                allow_no_geometry=allow_no_geometry,
+                profile=aws_profile,
+                geoparquet_version=geoparquet_version,
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_size,
+                row_group_size_mb=row_group_mb,
+            )
+        else:
+            convert_to_geoparquet(
+                input_file,
+                output_file,
+                skip_hilbert=skip_hilbert,
+                verbose=verbose,
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_size,
+                row_group_size_mb=row_group_mb,
+                wkt_column=wkt_column,
+                lat_column=lat_column,
+                lon_column=lon_column,
+                delimiter=delimiter,
+                layer=layer,
+                crs=crs,
+                skip_invalid=skip_invalid,
+                allow_no_geometry=allow_no_geometry,
+                profile=aws_profile,
+                geoparquet_version=geoparquet_version,
+            )
 
 
 def _convert_streaming(
@@ -1369,7 +1391,9 @@ def _reproject_impl_cli(
 @geoparquet_version_option
 @any_extension_option
 @show_sql_option
+@click.pass_context
 def convert_reproject(
+    ctx,
     input_file,
     output_file,
     dst_crs,
@@ -1408,21 +1432,22 @@ def convert_reproject(
     # Validate mutual exclusivity of row group options and get MB value
     row_group_mb = parse_row_group_options(row_group_size, row_group_size_mb)
 
-    _reproject_impl_cli(
-        input_file,
-        output_file,
-        dst_crs,
-        src_crs,
-        overwrite,
-        verbose,
-        aws_profile,
-        compression,
-        compression_level,
-        geoparquet_version,
-        row_group_size_mb=row_group_mb,
-        row_group_rows=row_group_size,
-        memory_limit=write_memory,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        _reproject_impl_cli(
+            input_file,
+            output_file,
+            dst_crs,
+            src_crs,
+            overwrite,
+            verbose,
+            aws_profile,
+            compression,
+            compression_level,
+            geoparquet_version,
+            row_group_size_mb=row_group_mb,
+            row_group_rows=row_group_size,
+            memory_limit=write_memory,
+        )
 
 
 @convert.command(name="geojson", cls=SingleFileCommand)
@@ -1476,7 +1501,9 @@ def convert_reproject(
 @verbose_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def convert_geojson(
+    ctx,
     input_file,
     output_file,
     overwrite,
@@ -1535,37 +1562,38 @@ def convert_geojson(
     # Validate aws_profile is only used with S3
     validate_profile_for_urls(aws_profile, input_file, output_file)
 
-    if output_file:
-        # File mode - use write_geojson which handles no-geometry case
-        write_geojson(
-            input_path=input_file,
-            output_path=output_file,
-            precision=precision,
-            write_bbox=write_bbox,
-            id_field=id_field,
-            description=description,
-            pretty=pretty,
-            keep_crs=keep_crs,
-            overwrite=overwrite,
-            verbose=verbose,
-            profile=aws_profile,
-        )
-    else:
-        # Streaming mode - use convert_to_geojson directly
-        convert_to_geojson(
-            input_path=input_file,
-            output_path=output_file,
-            rs=not no_rs,
-            precision=precision,
-            write_bbox=write_bbox,
-            id_field=id_field,
-            description=description,
-            seq=not no_seq,
-            pretty=pretty,
-            verbose=verbose,
-            profile=aws_profile,
-            keep_crs=keep_crs,
-        )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        if output_file:
+            # File mode - use write_geojson which handles no-geometry case
+            write_geojson(
+                input_path=input_file,
+                output_path=output_file,
+                precision=precision,
+                write_bbox=write_bbox,
+                id_field=id_field,
+                description=description,
+                pretty=pretty,
+                keep_crs=keep_crs,
+                overwrite=overwrite,
+                verbose=verbose,
+                profile=aws_profile,
+            )
+        else:
+            # Streaming mode - use convert_to_geojson directly
+            convert_to_geojson(
+                input_path=input_file,
+                output_path=output_file,
+                rs=not no_rs,
+                precision=precision,
+                write_bbox=write_bbox,
+                id_field=id_field,
+                description=description,
+                seq=not no_seq,
+                pretty=pretty,
+                verbose=verbose,
+                profile=aws_profile,
+                keep_crs=keep_crs,
+            )
 
 
 @convert.command(name="geopackage", cls=SingleFileCommand)
@@ -1581,7 +1609,9 @@ def convert_geojson(
 @verbose_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def convert_geopackage(
+    ctx,
     input_file,
     output_file,
     overwrite,
@@ -1618,14 +1648,15 @@ def convert_geopackage(
         # Generate output filename
         output_file = Path(input_file).stem + ".gpkg"
 
-    write_geopackage(
-        input_path=input_file,
-        output_path=output_file,
-        overwrite=overwrite,
-        layer_name=layer_name,
-        verbose=verbose,
-        profile=aws_profile,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        write_geopackage(
+            input_path=input_file,
+            output_path=output_file,
+            overwrite=overwrite,
+            layer_name=layer_name,
+            verbose=verbose,
+            profile=aws_profile,
+        )
 
 
 @convert.command(name="flatgeobuf", cls=SingleFileCommand)
@@ -1635,7 +1666,9 @@ def convert_geopackage(
 @verbose_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def convert_flatgeobuf(
+    ctx,
     input_file,
     output_file,
     overwrite,
@@ -1666,13 +1699,14 @@ def convert_flatgeobuf(
         # Generate output filename
         output_file = Path(input_file).stem + ".fgb"
 
-    write_flatgeobuf(
-        input_path=input_file,
-        output_path=output_file,
-        overwrite=overwrite,
-        verbose=verbose,
-        profile=aws_profile,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        write_flatgeobuf(
+            input_path=input_file,
+            output_path=output_file,
+            overwrite=overwrite,
+            verbose=verbose,
+            profile=aws_profile,
+        )
 
 
 @convert.command(name="csv", cls=SingleFileCommand)
@@ -1692,7 +1726,9 @@ def convert_flatgeobuf(
 @verbose_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def convert_csv(
+    ctx,
     input_file,
     output_file,
     overwrite,
@@ -1730,15 +1766,16 @@ def convert_csv(
         # Generate output filename
         output_file = Path(input_file).stem + ".csv"
 
-    write_csv(
-        input_path=input_file,
-        output_path=output_file,
-        include_wkt=not no_wkt,
-        include_bbox=not no_bbox,
-        overwrite=overwrite,
-        verbose=verbose,
-        profile=aws_profile,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        write_csv(
+            input_path=input_file,
+            output_path=output_file,
+            include_wkt=not no_wkt,
+            include_bbox=not no_bbox,
+            overwrite=overwrite,
+            verbose=verbose,
+            profile=aws_profile,
+        )
 
 
 @convert.command(name="shapefile", cls=SingleFileCommand)
@@ -1754,7 +1791,9 @@ def convert_csv(
 @verbose_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def convert_shapefile(
+    ctx,
     input_file,
     output_file,
     overwrite,
@@ -1796,14 +1835,15 @@ def convert_shapefile(
         # Generate output filename
         output_file = Path(input_file).stem + ".shp"
 
-    write_shapefile(
-        input_path=input_file,
-        output_path=output_file,
-        overwrite=overwrite,
-        encoding=encoding,
-        verbose=verbose,
-        profile=aws_profile,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        write_shapefile(
+            input_path=input_file,
+            output_path=output_file,
+            overwrite=overwrite,
+            encoding=encoding,
+            verbose=verbose,
+            profile=aws_profile,
+        )
 
 
 # Inspect command group
@@ -2222,7 +2262,9 @@ def extract(ctx):
 @verbose_option
 @aws_profile_option
 @any_extension_option
+@click.pass_context
 def extract_geoparquet(
+    ctx,
     input_file,
     output_file,
     include_cols,
@@ -2339,31 +2381,32 @@ def extract_geoparquet(
     # Parse row group options
     row_group_mb = parse_row_group_options(row_group_size, row_group_size_mb)
 
-    extract_impl(
-        input_parquet=input_file,
-        output_parquet=output_file,
-        include_cols=include_cols,
-        exclude_cols=exclude_cols,
-        bbox=bbox,
-        geometry=geometry,
-        where=where,
-        limit=limit,
-        skip_count=skip_count,
-        use_first_geometry=use_first_geometry,
-        dry_run=dry_run,
-        show_sql=show_sql,
-        verbose=verbose,
-        compression=compression.upper(),
-        compression_level=compression_level,
-        row_group_size_mb=row_group_mb,
-        row_group_rows=row_group_size,
-        geoparquet_version=geoparquet_version,
-        allow_schema_diff=allow_schema_diff,
-        hive_input=hive_input,
-        write_strategy=write_strategy,
-        memory_limit=write_memory,
-        overwrite=overwrite,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        extract_impl(
+            input_parquet=input_file,
+            output_parquet=output_file,
+            include_cols=include_cols,
+            exclude_cols=exclude_cols,
+            bbox=bbox,
+            geometry=geometry,
+            where=where,
+            limit=limit,
+            skip_count=skip_count,
+            use_first_geometry=use_first_geometry,
+            dry_run=dry_run,
+            show_sql=show_sql,
+            verbose=verbose,
+            compression=compression.upper(),
+            compression_level=compression_level,
+            row_group_size_mb=row_group_mb,
+            row_group_rows=row_group_size,
+            geoparquet_version=geoparquet_version,
+            allow_schema_diff=allow_schema_diff,
+            hive_input=hive_input,
+            write_strategy=write_strategy,
+            memory_limit=write_memory,
+            overwrite=overwrite,
+        )
 
 
 @extract.command(name="arcgis", cls=SingleFileCommand)
@@ -2442,7 +2485,9 @@ def extract_geoparquet(
 @any_extension_option
 @aws_profile_option
 @show_sql_option
+@click.pass_context
 def extract_arcgis(
+    ctx,
     service_url,
     output_file,
     token,
@@ -2548,32 +2593,33 @@ def extract_arcgis(
         except ValueError as e:
             raise click.BadParameter(f"Invalid bbox format: {e}. Use xmin,ymin,xmax,ymax") from e
 
-    convert_arcgis_to_geoparquet(
-        service_url=service_url,
-        output_file=output_file,
-        token=token,
-        token_file=token_file,
-        username=username,
-        password=password,
-        portal_url=portal_url,
-        where=where,
-        bbox=bbox_tuple,
-        include_cols=include_cols,
-        exclude_cols=exclude_cols,
-        limit=limit,
-        skip_hilbert=skip_hilbert,
-        skip_bbox=skip_bbox,
-        max_workers=workers,
-        batch_size=batch_size,
-        compression=compression.upper(),
-        compression_level=compression_level,
-        verbose=verbose,
-        geoparquet_version=geoparquet_version,
-        profile=aws_profile,
-        row_group_size_mb=row_group_mb,
-        row_group_rows=row_group_size,
-        overwrite=overwrite,
-    )
+    with _activate_s3(ctx, aws_profile=aws_profile):
+        convert_arcgis_to_geoparquet(
+            service_url=service_url,
+            output_file=output_file,
+            token=token,
+            token_file=token_file,
+            username=username,
+            password=password,
+            portal_url=portal_url,
+            where=where,
+            bbox=bbox_tuple,
+            include_cols=include_cols,
+            exclude_cols=exclude_cols,
+            limit=limit,
+            skip_hilbert=skip_hilbert,
+            skip_bbox=skip_bbox,
+            max_workers=workers,
+            batch_size=batch_size,
+            compression=compression.upper(),
+            compression_level=compression_level,
+            verbose=verbose,
+            geoparquet_version=geoparquet_version,
+            profile=aws_profile,
+            row_group_size_mb=row_group_mb,
+            row_group_rows=row_group_size,
+            overwrite=overwrite,
+        )
 
 
 @extract.command(name="bigquery")
@@ -5345,7 +5391,9 @@ def publish_stac(input, output, bucket, public_url, collection_id, item_id, over
 )
 @verbose_option
 @dry_run_option
+@click.pass_context
 def publish_upload(
+    ctx,
     source,
     destination,
     aws_profile,
@@ -5382,25 +5430,32 @@ def publish_upload(
       # Stop on first error instead of continuing
       gpio publish upload output/ s3://bucket/dataset/ --fail-fast
     """
-    # Check credentials before attempting upload
-    creds_ok, hint = check_credentials(destination, aws_profile)
-    if not creds_ok:
-        raise click.ClickException(f"Authentication failed:\n\n{hint}")
-
-    upload_impl(
-        source=source,
-        destination=destination,
-        profile=aws_profile,
-        pattern=pattern,
-        max_files=max_files,
-        chunk_concurrency=chunk_concurrency,
-        chunk_size=chunk_size,
-        fail_fast=fail_fast,
-        dry_run=dry_run,
+    with _activate_s3(
+        ctx,
+        aws_profile=aws_profile,
         s3_endpoint=s3_endpoint,
         s3_region=s3_region,
-        s3_use_ssl=not s3_no_ssl,
-    )
+        s3_no_ssl=s3_no_ssl,
+    ) as s3_config:
+        # Check credentials before attempting upload
+        creds_ok, hint = check_credentials(destination, s3_config.get("profile"))
+        if not creds_ok:
+            raise click.ClickException(f"Authentication failed:\n\n{hint}")
+
+        upload_impl(
+            source=source,
+            destination=destination,
+            profile=s3_config["profile"],
+            pattern=pattern,
+            max_files=max_files,
+            chunk_concurrency=chunk_concurrency,
+            chunk_size=chunk_size,
+            fail_fast=fail_fast,
+            dry_run=dry_run,
+            s3_endpoint=s3_config["s3_endpoint"],
+            s3_region=s3_config["s3_region"],
+            s3_use_ssl=s3_config["s3_use_ssl"],
+        )
 
 
 @check.command(name="stac")
