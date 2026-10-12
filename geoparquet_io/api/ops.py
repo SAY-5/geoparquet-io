@@ -1878,8 +1878,9 @@ def sub_partition_by_s2(
 
 
 def read_bigquery(
-    table_id: str,
+    table_id: str | None = None,
     *,
+    sql: str | None = None,
     project: str | None = None,
     credentials_file: str | None = None,
     where: str | None = None,
@@ -1905,8 +1906,20 @@ def read_bigquery(
     can be parsed by specifying geography_column and geometry_format.
 
     Args:
-        table_id: Fully qualified BigQuery table ID (project.dataset.table)
-        project: GCP project ID (overrides project in table_id if set)
+        table_id: Fully qualified BigQuery table ID (project.dataset.table).
+            Omit it when ``sql`` is given.
+        sql: GoogleSQL to run as the source, in place of ``table_id``. For
+            what ``where`` cannot express -- a window function, a join, a
+            GROUP BY. Must be a single SELECT or WITH query. Requires
+            ``project``, and is mutually exclusive with every argument that
+            shapes the query (``where``, ``bbox``,
+            ``bbox_mode``, ``bbox_threshold``, ``limit``, ``columns``,
+            ``exclude_columns``): the statement says all of that itself.
+            Filter inside it -- a query job materializes its whole result
+            first, so an unfiltered statement over a large relation fails
+            with "Response too large to return".
+        project: GCP project ID (overrides project in table_id if set;
+            required with ``sql``)
         credentials_file: Path to service account JSON file
         where: SQL WHERE clause for filtering (BigQuery SQL syntax)
         bbox: Bounding box for spatial filter as "minx,miny,maxx,maxy"
@@ -1951,6 +1964,13 @@ def read_bigquery(
         ...     geography_column='geometry',
         ...     geometry_format='wkt'
         ... )
+
+        >>> # Run your own GoogleSQL instead of reading a table
+        >>> table = ops.read_bigquery(
+        ...     sql="SELECT name, geog FROM `p.d.t` QUALIFY ROW_NUMBER() "
+        ...         "OVER (PARTITION BY id ORDER BY version DESC) = 1",
+        ...     project='myproject',
+        ... )
     """
     from geoparquet_io.core.column_selection import join_column_list
     from geoparquet_io.core.extract_bigquery import extract_bigquery
@@ -1963,25 +1983,27 @@ def read_bigquery(
     include_cols = join_column_list(columns, "columns")
     exclude_cols = join_column_list(exclude_columns, "exclude_columns")
 
+    source = table_id if table_id is not None else "the sql query"
+
     # Validate bbox_mode
     valid_bbox_modes = {"auto", "server", "local"}
     if bbox_mode not in valid_bbox_modes:
         raise ValueError(
-            f"Invalid bbox_mode '{bbox_mode}' for table '{table_id}'. "
+            f"Invalid bbox_mode '{bbox_mode}' for {source!r}. "
             f"Must be one of: {', '.join(sorted(valid_bbox_modes))}"
         )
 
     # Validate bbox_threshold
     if not isinstance(bbox_threshold, int) or bbox_threshold < 0:
         raise ValueError(
-            f"Invalid bbox_threshold '{bbox_threshold}' for table '{table_id}'. "
-            "Must be an integer >= 0."
+            f"Invalid bbox_threshold '{bbox_threshold}' for {source!r}. Must be an integer >= 0."
         )
 
     # Get PyArrow table (don't write to file)
     arrow_table = extract_bigquery(
         table_id=table_id,
         output_parquet=None,  # Return table instead of writing
+        sql=sql,
         project=project,
         credentials_file=credentials_file,
         where=where,
@@ -1999,7 +2021,7 @@ def read_bigquery(
     )
 
     if arrow_table is None:
-        raise RuntimeError(f"Failed to read from BigQuery table: {table_id}")
+        raise RuntimeError(f"Failed to read from BigQuery: {table_id or sql}")
 
     return arrow_table
 
