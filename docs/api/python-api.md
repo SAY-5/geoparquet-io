@@ -178,8 +178,14 @@ table = gpio.Table.from_bigquery(
 
 See the [Extract Guide](../guide/extract.md#bbox-filtering-mode-server-vs-local) for detailed tradeoff analysis.
 
+!!! note "BigQuery views"
+    A view, materialized view or external table is read through a BigQuery
+    query job instead of the Storage Read API, detected and retried
+    automatically. The job is billed by bytes scanned; the selected columns,
+    `where`, `bbox` and `limit` are pushed into it, and on a view `where` runs
+    as GoogleSQL (bare column names, plain single-quoted strings, no comments).
+
 !!! warning "BigQuery Limitations"
-    - **Cannot read views or external tables** (Storage Read API limitation)
     - BIGNUMERIC columns are not supported
 
 ### Reading from ArcGIS Feature Services

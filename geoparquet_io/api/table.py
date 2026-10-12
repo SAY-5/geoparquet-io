@@ -708,8 +708,15 @@ class Table:
             RuntimeError: If BigQuery query fails
 
         Note:
-            **Cannot read BigQuery views or external tables** - this is a
-            limitation of the BigQuery Storage Read API.
+            A view, materialized view or external table is read with a
+            BigQuery query job rather than the Storage Read API, which serves
+            physical tables only. gpio detects this from BigQuery's refusal on
+            the read and retries automatically. The job is billed by bytes
+            scanned, and ``where``, ``bbox`` and ``limit`` are pushed into it
+            rather than applied afterwards, so filter a large view or the job
+            can fail with "Response too large to return". So are the selected
+            columns. On a view ``where`` runs as GoogleSQL, so only bare column
+            names, plain single-quoted strings and no comments are accepted.
 
         Example:
             >>> import geoparquet_io as gpio

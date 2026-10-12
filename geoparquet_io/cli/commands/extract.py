@@ -625,8 +625,15 @@ def extract_bigquery_cmd(
     If no geometry column is found, the output is plain Parquet.
 
     \b
+    A view, materialized view or external table is read with a BigQuery query
+    job instead of the Storage Read API, which serves physical tables only.
+    This is detected and retried automatically. The job is billed by bytes
+    scanned; the selected columns and --where/--bbox/--limit are pushed into
+    it, and on a view --where runs as GoogleSQL (bare column names, plain
+    single-quoted strings, no comments).
+
+    \b
     Limitations:
-    - Cannot read BigQuery views or external tables (Storage Read API limitation)
     - BIGNUMERIC columns are not supported
 
     Examples:
