@@ -170,6 +170,11 @@ class WFSLayerInfo:
 
 # Default timeout for HTTP requests (seconds)
 DEFAULT_TIMEOUT = 60.0
+# A GetFeature page can take minutes on a large layer; the startIndex probe
+# asks for one feature. Both are passed per request, never only to the shared
+# client, which keeps the timeout of whichever caller built it (#1184).
+_PAGE_TIMEOUT = 600.0
+_PROBE_TIMEOUT = 30.0
 
 
 def _get_shared_http_client(timeout: float = DEFAULT_TIMEOUT):
@@ -229,7 +234,10 @@ def _make_request(
             debug(f"HTTP GET: {request_desc[:100]}{'...' if len(request_desc) > 100 else ''}")
             start_time = time.time()
             client = _get_shared_http_client(timeout=timeout)
-            response = client.get(url, params=params, headers=headers)
+            # The timeout rides on the request, not just the client: the shared
+            # client keeps the timeout of whichever caller built it first, so a
+            # client-level timeout alone would cap every later caller (#1184).
+            response = client.get(url, params=params, headers=headers, timeout=timeout)
             elapsed = time.time() - start_time
             response.raise_for_status()
             content = bytes(response.content)
@@ -2034,12 +2042,15 @@ def _fetch_wfs_page(
         body_kind = "json"
         total_bytes = 0
         try:
-            client = _get_shared_http_client(timeout=600)
+            client = _get_shared_http_client(timeout=_PAGE_TIMEOUT)
 
+            # Per-request timeout: the shared client was usually built by the
+            # 60s feature-count probe, and keeps that timeout (#1184).
             with client.stream(
                 "GET",
                 url,
                 headers={"Accept": accept, "Accept-Encoding": "gzip, deflate"},
+                timeout=_PAGE_TIMEOUT,
             ) as response:
                 # Check HTTP status
                 if response.status_code == 400:
@@ -2434,8 +2445,12 @@ def _probe_startindex_limit(
     )
 
     try:
-        client = _get_shared_http_client(timeout=30)
-        response = client.get(url, headers={"Accept-Encoding": "gzip, deflate"})
+        client = _get_shared_http_client(timeout=_PROBE_TIMEOUT)
+        # Per-request timeout, so this probe neither inherits nor pins the
+        # shared client's timeout (#1184).
+        response = client.get(
+            url, headers={"Accept-Encoding": "gzip, deflate"}, timeout=_PROBE_TIMEOUT
+        )
         if response.status_code == 400:
             body = response.text.lower()
             if "startindex" in body:

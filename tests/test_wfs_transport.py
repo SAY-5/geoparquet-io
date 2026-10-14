@@ -491,6 +491,32 @@ def test_a_failed_startindex_probe_warns_about_unbounded_pagination(monkeypatch,
     assert "pagination past a server's limit" in caplog.text
 
 
+def test_the_probe_does_not_pin_the_timeout_of_later_requests(monkeypatch):
+    """Probe first (30s builds the client), then a page and a plain request (#1184)."""
+    http = FakeTransport.install(monkeypatch)
+    http.respond(_is_startindex_probe, geojson_reply(_geojson(0)))
+    http.respond(_is_hits, xml_reply(b'<wfs:FeatureCollection numberMatched="3"/>'))
+    http.respond(_is_getfeature, geojson_reply(_geojson(3)))
+
+    _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+    _fetch_wfs_page(SERVICE, output_format="application/json")
+    _make_request(SERVICE, params={"resultType": "hits"}, timeout=9.0)
+
+    assert [request.timeout for request in http.requests] == [30.0, 600.0, 9.0]
+
+
+def test_probe_handles_400_error_without_startindex_keyword(monkeypatch):
+    """A 400 response without 'startindex' keyword returns None."""
+    http = FakeTransport.install(monkeypatch)
+    http.respond(
+        _is_startindex_probe,
+        bytes_reply(b"Bad Request: Invalid parameter", status=400, content_type="text/plain"),
+    )
+
+    result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+    assert result is None
+
+
 # ---------------------------------------------------------------------------
 # _fetch_wfs_page - streaming, content-type dispatch, retries
 # ---------------------------------------------------------------------------
@@ -707,6 +733,28 @@ def test_an_unknowable_count_falls_back_to_a_single_request(monkeypatch, caplog)
 # ---------------------------------------------------------------------------
 # convert_wfs_to_geoparquet - the file that gets written
 # ---------------------------------------------------------------------------
+
+
+def test_every_request_runs_with_the_timeout_its_caller_asked_for(monkeypatch, tmp_path):
+    """The hits probe (60s) builds the shared client first; pages still get 600s (#1184).
+
+    The shared client keeps the timeout it was built with, so a timeout has to
+    travel with each request. A page fetch that took 80s failed because it ran
+    under the first caller's timeout, not the 600s it asked for.
+    """
+    http = stub_service(FakeTransport.install(monkeypatch), total=30)
+    wfs_capabilities(monkeypatch, CAPABILITIES, schema=SCHEMA)
+
+    convert_wfs_to_geoparquet(
+        SERVICE, TYPENAME, str(tmp_path / "out.parquet"), version="1.1.0", page_size=10
+    )
+
+    hits = [r.timeout for r in http.requests if _is_hits(r)]
+    probes = [r.timeout for r in http.requests if _is_startindex_probe(r)]
+    pages = [r.timeout for r in http.requests if _is_getfeature(r)]
+    assert hits == [60.0]
+    assert probes and set(probes) == {30.0}
+    assert len(pages) >= 3 and set(pages) == {600.0}
 
 
 def test_the_written_file_is_spec_clean(monkeypatch, tmp_path):
