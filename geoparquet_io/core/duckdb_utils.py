@@ -178,6 +178,54 @@ def restore_duckdb_settings(
                 debug(f"Could not restore DuckDB setting {key}: {e}")
 
 
+# What DuckDB's Python client raises when a SIGINT stops a running query
+# (measured on 1.5.6). It is a plain RuntimeError, not an InterruptException.
+_QUERY_INTERRUPTED = "Query interrupted"
+
+
+def is_interrupt(exc: BaseException) -> bool:
+    """Whether ``exc`` is the user stopping the run (Ctrl-C), not a failure.
+
+    A guard that turns errors into verdicts must re-raise these. DuckDB
+    reports a SIGINT during a query as ``RuntimeError("Query interrupted")``,
+    which ``except Exception`` would otherwise swallow and carry on past.
+
+    The cause and context chain is searched too, since a caller that wraps
+    errors (``apply_all_fixes`` raises ``GeoParquetError(...) from e``) would
+    otherwise hide the interrupt. The walk is bounded and stops on a cycle.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(seen) < _MAX_CHAIN:
+        if _is_interrupt_itself(current):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+_MAX_CHAIN = 32
+
+
+def _is_interrupt_itself(exc: BaseException) -> bool:
+    if isinstance(exc, (KeyboardInterrupt, duckdb.InterruptException)):
+        return True
+    return isinstance(exc, (RuntimeError, duckdb.Error)) and str(exc) == _QUERY_INTERRUPTED
+
+
+def disable_geoparquet_conversion(con: duckdb.DuckDBPyConnection) -> None:
+    """Read a GeoParquet WKB column as the BLOB it stores, not as GEOMETRY.
+
+    With conversion on, DuckDB presents a WKB column as GEOMETRY and decodes
+    each value only when something reads it, so a check that counts values
+    passes bytes it never looked at, and the first query that does decode one
+    fails on a zero-length or malformed value with no row to point at (#1082).
+    A checker owns its connection and wants the bytes, so it turns this off.
+    Columns stored with the native Parquet GEOMETRY type stay GEOMETRY.
+    """
+    con.execute("SET enable_geoparquet_conversion = false")
+
+
 def _current_setting(con: duckdb.DuckDBPyConnection, key: str) -> object:
     return con.execute(f"SELECT current_setting('{key}')").fetchone()[0]
 

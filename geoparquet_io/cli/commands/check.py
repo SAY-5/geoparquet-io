@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import TypeVar
 
 import click
-import duckdb
 
 from geoparquet_io.cli._shared import _activate_s3, create_default_group, init_group_context
 from geoparquet_io.cli.decorators import (
@@ -30,6 +29,7 @@ from geoparquet_io.cli.fix_helpers import NoBackupConfirmation, handle_fix_commo
 from geoparquet_io.core.check_parquet_structure import CheckProfile
 from geoparquet_io.core.check_parquet_structure import check_all as check_structure_impl
 from geoparquet_io.core.check_spatial_order import check_spatial_order as check_spatial_impl
+from geoparquet_io.core.duckdb_utils import is_interrupt
 from geoparquet_io.core.geo_metadata import BBOX_REWRITE_HINT
 from geoparquet_io.core.logging_config import configure_verbose
 
@@ -83,6 +83,8 @@ class MultiFileCheckRunner:
         self.issues: list[tuple[str, str, str]] = []  # (file, level, message)
         self.fixed: list[tuple[str, str | None]] = []  # (output path, backup path)
         self.fix_failures: list[tuple[str, str]] = []  # (file, error)
+        self.check_errors: list[tuple[str, str]] = []  # (file, why a check could not run)
+        self._interrupted = False
         self.current_index = 0
         self.is_multi_file = len(files) > 1
 
@@ -153,18 +155,19 @@ class MultiFileCheckRunner:
         A single-file run keeps its old shape -- the exception propagates with
         its message. Click's own exceptions always propagate: a declined
         prompt or a bad parameter is a verdict on the invocation, not on this
-        file. So does an interrupt: DuckDB raises Ctrl-C as a plain
-        ``InterruptException``, and treating that as "this file failed, next"
+        file. So does an interrupt: DuckDB raises Ctrl-C as an
+        ``InterruptException`` or a plain ``RuntimeError``, and treating that as "this file failed, next"
         would keep rewriting files after the user asked it to stop.
         """
         try:
             return call()
         except (click.Abort, click.ClickException, click.exceptions.Exit):
             raise
-        except (KeyboardInterrupt, duckdb.InterruptException):
-            self._print_fix_summary()
+        except KeyboardInterrupt:
+            self._on_interrupt()
             raise
         except Exception as e:
+            self._raise_if_interrupt(e)
             if not self.is_multi_file:
                 raise
             self.fix_failures.append((file_path, str(e)))
@@ -175,6 +178,63 @@ class MultiFileCheckRunner:
     def run_check(self, file_path: str, check_call: Callable[[], dict]) -> dict | None:
         """The check stage for one file, or None when it could not be checked."""
         return self._guard(file_path, check_call, "Check")
+
+    def run_stage(self, file_path: str, call: Callable[[], T], stage: str) -> T | None:
+        """One check of several on a file. If it cannot run, say so and carry on.
+
+        ``check all`` is a report, so one check that dies must not take the
+        others with it (#1082). The failure is printed in place of the check's
+        result and counted, and :meth:`raise_if_any_check_errored` turns it
+        into a non-zero exit, since a check that could not run is not a pass.
+        Click exceptions and interrupts propagate, as in :meth:`_guard`.
+        """
+        try:
+            return call()
+        except (click.Abort, click.ClickException, click.exceptions.Exit):
+            raise
+        except KeyboardInterrupt:
+            self._on_interrupt()
+            raise
+        except Exception as e:
+            self._raise_if_interrupt(e)
+            self.note_check_error(file_path, stage, str(e))
+            return None
+
+    def _raise_if_interrupt(self, error: Exception) -> None:
+        """Turn ``error`` into ``KeyboardInterrupt`` when it is Ctrl-C.
+
+        DuckDB reports a SIGINT as ``InterruptException`` or as a plain
+        ``RuntimeError("Query interrupted")``. Either one means stop, never
+        "this check failed, carry on and --fix the file". Raised as
+        ``KeyboardInterrupt``, Click ends the run with "Aborted!" instead of a
+        traceback.
+        """
+        if is_interrupt(error):
+            self._on_interrupt()
+            raise KeyboardInterrupt(str(error)) from error
+
+    def _on_interrupt(self) -> None:
+        """Print the fix summary once, however many guards the interrupt crosses."""
+        if not self._interrupted:
+            self._interrupted = True
+            self._print_fix_summary()
+
+    def note_check_error(self, file_path: str, stage: str, reason: str) -> None:
+        """Record and print a check that could not run on ``file_path``."""
+        self.check_errors.append((file_path, f"{stage} could not run, {reason}"))
+        click.echo("\r" + " " * 80 + "\r", nl=False)
+        click.echo(
+            click.style(f"  ✗ {stage} could not run on {Path(file_path).name}, {reason}", fg="red")
+        )
+
+    def errored(self, file_path: str) -> bool:
+        """Whether a check could not run on ``file_path``."""
+        return any(path == file_path for path, _ in self.check_errors)
+
+    def raise_if_any_check_errored(self) -> None:
+        """Exit non-zero when a check could not run on some file."""
+        if self.check_errors:
+            raise click.exceptions.Exit(1)
 
     def apply_fix(self, file_path: str, fix_call: Callable[[], tuple[str, str | None] | None]):
         """Run one file's fix, recording it -- or its failure -- and carrying on (#1041).
@@ -360,6 +420,70 @@ def begin_check_run(
     )
 
 
+_SPATIAL_STAGE = "Spatial order check"
+
+
+def _spatial_stage(runner: MultiFileCheckRunner, file_path: str, call) -> dict:
+    """The spatial order verdict for ``check all``, never an exception.
+
+    A check that could not read the geometry comes back with an ``error``
+    (from core) or raises. Either way it is reported, counted, and handed on
+    as a failed, unfixable result, so the spec validation still runs.
+    """
+    result: dict | None = runner.run_stage(file_path, call, _SPATIAL_STAGE)
+    if result is None:
+        reason = runner.check_errors[-1][1]
+        return {
+            "passed": False,
+            "ratio": None,
+            "issues": [],
+            "recommendations": [],
+            "fix_available": False,
+            "error": reason,
+        }
+    if isinstance(result, dict) and result.get("error"):
+        runner.note_check_error(file_path, _SPATIAL_STAGE, result["error"])
+        return _without_issue_lines(result)
+    return result
+
+
+def _without_issue_lines(result: dict) -> dict:
+    """A result whose error was already printed by ``note_check_error``.
+
+    The reason is dropped from ``issues`` so ``record_result`` does not print
+    it a second time, and ``failed`` keeps the file counted as failed.
+    """
+    return {**result, "issues": [], "failed": True}
+
+
+def _echo_spec_result(spec_result, spec_details: bool) -> None:
+    """Print the spec validation block of ``check all``."""
+    if spec_result is None:
+        click.echo(click.style("  ✗ Spec validation could not run", fg="red"))
+        return
+    if spec_details:
+        from geoparquet_io.core.validate import format_terminal_output
+
+        format_terminal_output(spec_result)
+        return
+    if spec_result.failed_count > 0:
+        click.echo(
+            click.style(
+                f"  ✗ {spec_result.failed_count} failed, {spec_result.passed_count} passed",
+                fg="red",
+            )
+        )
+    elif spec_result.warning_count > 0:
+        click.echo(
+            click.style(
+                f"  ⚠ {spec_result.passed_count} passed, {spec_result.warning_count} warnings",
+                fg="yellow",
+            )
+        )
+    else:
+        click.echo(click.style(f"  ✓ {spec_result.passed_count} checks passed", fg="green"))
+
+
 @check.command(name="all", cls=GlobAwareCommand)
 @click.argument("parquet_file")
 @click.option(
@@ -492,6 +616,8 @@ def check_all(
             def run_all_checks(file_path=file_path, show_output=show_output, quiet=quiet):
                 from geoparquet_io.core.validate import validate_geoparquet
 
+                # The structure check is the gate. A file it cannot read fails
+                # as a whole (run_check), and is not spatially checked or fixed.
                 structure = check_structure_impl(
                     file_path,
                     verbose and show_output,
@@ -501,16 +627,29 @@ def check_all(
                 )
                 if show_output:
                     click.echo("\nSpatial Order Analysis:")
-                spatial = check_spatial_impl(
+                spatial = _spatial_stage(
+                    runner,
                     file_path,
-                    random_sample_size,
-                    limit_rows,
-                    verbose and show_output,
-                    return_results=True,
-                    quiet=quiet,
+                    partial(
+                        check_spatial_impl,
+                        file_path,
+                        random_sample_size,
+                        limit_rows,
+                        verbose and show_output,
+                        return_results=True,
+                        quiet=quiet,
+                    ),
                 )
-                spec = validate_geoparquet(
-                    file_path, validate_data=True, sample_size=1000, verbose=False
+                spec = runner.run_stage(
+                    file_path,
+                    partial(
+                        validate_geoparquet,
+                        file_path,
+                        validate_data=True,
+                        sample_size=1000,
+                        verbose=False,
+                    ),
+                    "Spec validation",
                 )
                 return {"structure": structure, "spatial": spatial, "spec": spec}
 
@@ -531,45 +670,28 @@ def check_all(
             # Display spec validation results
             if show_output:
                 click.echo("\nSpec Validation:")
-                if spec_details:
-                    # Full output
-                    from geoparquet_io.core.validate import format_terminal_output
-
-                    format_terminal_output(spec_result)
-                else:
-                    # Summary only
-                    if spec_result.failed_count > 0:
-                        click.echo(
-                            click.style(
-                                f"  ✗ {spec_result.failed_count} failed, "
-                                f"{spec_result.passed_count} passed",
-                                fg="red",
-                            )
-                        )
-                    elif spec_result.warning_count > 0:
-                        click.echo(
-                            click.style(
-                                f"  ⚠ {spec_result.passed_count} passed, "
-                                f"{spec_result.warning_count} warnings",
-                                fg="yellow",
-                            )
-                        )
-                    else:
-                        click.echo(
-                            click.style(f"  ✓ {spec_result.passed_count} checks passed", fg="green")
-                        )
+                _echo_spec_result(spec_result, spec_details)
 
             # Aggregate results for runner tracking (include spec failures)
             combined_passed, combined_issues, _ = aggregate_check_results(
                 structure_results, spatial_result
             )
             # Include spec failures in passed status and issues summary
-            if spec_result.failed_count > 0:
+            if spec_result is None:
+                combined_passed = False
+                combined_issues.append("❌ Spec validation could not run")
+            elif spec_result.failed_count > 0:
                 combined_passed = False
                 combined_issues.append(f"Spec validation: {spec_result.failed_count} checks failed")
             runner.record_result(
                 file_path,
-                {"passed": combined_passed, "issues": combined_issues, **structure_results},
+                {
+                    "passed": combined_passed,
+                    "issues": combined_issues,
+                    **structure_results,
+                    # A check that could not run is a failure, already printed.
+                    "failed": bool(structure_results.get("failed")) or runner.errored(file_path),
+                },
             )
 
             # If --fix flag is set, apply fixes
@@ -626,6 +748,7 @@ def check_all(
         # Print summary for multi-file checks
         runner.print_summary()
         runner.raise_if_any_fix_failed()
+        runner.raise_if_any_check_errored()
 
 
 @check.command(name="spatial", cls=GlobAwareCommand)
@@ -714,6 +837,11 @@ def check_spatial(
             )
             if result is None:
                 continue
+            if result.get("error"):
+                # Could not read the geometry, so there is no verdict and no fix.
+                runner.note_check_error(file_path, _SPATIAL_STAGE, result["error"])
+                runner.record_result(file_path, _without_issue_lines(result))
+                continue
             ratio = result["ratio"]
             passed = result.get("passed", ratio < 0.5 if ratio is not None else True)
 
@@ -792,6 +920,7 @@ def check_spatial(
         # Print summary for multi-file checks
         runner.print_summary()
         runner.raise_if_any_fix_failed()
+        runner.raise_if_any_check_errored()
 
 
 @check.command(name="compression", cls=GlobAwareCommand)
