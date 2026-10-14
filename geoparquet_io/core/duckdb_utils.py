@@ -5,13 +5,14 @@ This module provides functions for creating and managing DuckDB connections
 with appropriate extensions loaded for GeoParquet operations.
 """
 
+import datetime
 import os
 import re
 import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -1263,6 +1264,112 @@ class _DuckDBFieldWrapper:
 
     def __init__(self, col_info):
         self.name = col_info.get("name", "")
+
+
+_TIMESTAMPTZ = "TIMESTAMP WITH TIME ZONE"
+_UTC = datetime.timezone.utc
+
+
+def _output_types(con, query: str, params=None) -> list[str]:
+    """The SQL type of each output column of ``query``. DESCRIBE binds it without a scan."""
+    return [column[1] for column in con.execute(f"DESCRIBE {query}", params).fetchall()]
+
+
+def _without_timestamptz(
+    con, query: str, params, column_types: Sequence[str] | None
+) -> tuple[str, list[int]]:
+    """``query`` with its TIMESTAMPTZ columns as UTC TIMESTAMPs, and their positions.
+
+    ``column_types`` spares the DESCRIBE when the caller already knows them.
+    Positional references (``#n``) keep duplicate output names, such as two bare
+    ``MIN(...)``, apart. The query sits on its own lines so a trailing ``--``
+    comment cannot swallow the closing parenthesis.
+    """
+    if column_types is None:
+        column_types = _output_types(con, query, params)
+    positions = [i for i, type_ in enumerate(column_types) if type_ == _TIMESTAMPTZ]
+    if not positions:
+        return query, positions
+    select = ", ".join(
+        f"timezone('UTC', #{i + 1})" if i in positions else f"#{i + 1}"
+        for i in range(len(column_types))
+    )
+    return f"SELECT {select} FROM (\n{query.rstrip().rstrip(';')}\n)", positions
+
+
+def _session_zone(con) -> datetime.tzinfo:
+    """The connection's TimeZone setting as a tzinfo, UTC when Python cannot resolve it."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    (name,) = con.execute("SELECT current_setting('TimeZone')").fetchone()
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return _UTC
+
+
+def _utc_as_zone(value, zone: datetime.tzinfo):
+    """A naive UTC value as an aware datetime in ``zone``, the way ``fetchone()`` gives it.
+
+    Infinities stay as ``fetchone()`` clamps them (naive ``datetime.max``/``min``).
+    A BC or year 10000+ value is DuckDB's UTC text, and keeps the ``+00`` that
+    ``fetchone()`` gives it, so read back as a literal it means the same instant
+    in any session time zone. A value too close to year 1 or 9999 to shift into
+    ``zone`` stays in UTC, where ``fetchone()`` raises.
+    """
+    if isinstance(value, str):
+        return f"{value}+00"
+    if not isinstance(value, datetime.datetime) or value in (
+        datetime.datetime.max,
+        datetime.datetime.min,
+    ):
+        return value
+    aware = value.replace(tzinfo=_UTC)
+    try:
+        return aware.astimezone(zone)
+    except OverflowError:  # within hours of year 1 or 9999
+        return aware
+
+
+def _restore_zones(rows: list[tuple], positions: list[int], zone) -> list[tuple]:
+    if not positions:
+        return rows
+    return [
+        tuple(_utc_as_zone(v, zone) if i in positions else v for i, v in enumerate(row))
+        for row in rows
+    ]
+
+
+def fetch_rows(
+    con, query: str, params=None, *, column_types: Sequence[str] | None = None
+) -> list[tuple]:
+    """Run ``query`` and return every row as ``fetchall()`` would, without needing pytz.
+
+    Use this instead of ``fetchall()`` whenever a row can carry a user column's
+    value. DuckDB's Python conversion of a TIMESTAMP WITH TIME ZONE imports
+    ``pytz``, which gpio does not depend on. Those columns are fetched as UTC
+    TIMESTAMPs and made aware in the session time zone with ``zoneinfo``. Every
+    other column goes through ``fetchall()`` untouched. A TIMESTAMPTZ nested in
+    a STRUCT, LIST or MAP still needs pytz, as it does with ``fetchall()``.
+
+    Finding those columns costs a DESCRIBE of ``query``. A caller that already
+    knows the output types passes them as ``column_types`` to skip it.
+    """
+    rewritten, positions = _without_timestamptz(con, query, params, column_types)
+    zone = _session_zone(con) if positions else None
+    return _restore_zones(con.execute(rewritten, params).fetchall(), positions, zone)
+
+
+def fetch_row(
+    con, query: str, params=None, *, column_types: Sequence[str] | None = None
+) -> tuple | None:
+    """The first row of ``query`` as :func:`fetch_rows` builds it, or None when it is empty."""
+    rewritten, positions = _without_timestamptz(con, query, params, column_types)
+    zone = _session_zone(con) if positions else None
+    row = con.execute(rewritten, params).fetchone()
+    if row is None:
+        return None
+    return _restore_zones([row], positions, zone)[0]
 
 
 def _get_query_columns(con, query: str) -> list[str]:
