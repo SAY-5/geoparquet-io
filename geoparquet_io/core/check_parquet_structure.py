@@ -4,6 +4,12 @@
 from enum import Enum
 
 from geoparquet_io.core.bbox_structure import check_bbox_structure
+from geoparquet_io.core.check_verdict import (
+    ISSUE_SEVERITY_KEY,
+    SEVERITY_KEY,
+    combine_results,
+    severity,
+)
 from geoparquet_io.core.duckdb_metadata import get_compression_info as duckdb_get_compression_info
 from geoparquet_io.core.duckdb_metadata import get_geo_metadata, get_row_group_stats_summary
 from geoparquet_io.core.file_type import detect_geoparquet_file_type
@@ -443,7 +449,8 @@ def _check_parquet_geo_only(parquet_file, file_type_info, verbose, return_result
     if not quiet:
         progress("\nParquet Geo Analysis:")
         success("✓ File uses native Parquet GEOMETRY/GEOGRAPHY types")
-        warn("⚠️  No GeoParquet metadata (file uses parquet-geo-only format)")
+        # Information, not a finding: parquet-geo-only is a valid layout.
+        info("ℹ️  No GeoParquet metadata (file uses parquet-geo-only format)")
         info("   Use 'gpio convert --geoparquet-version 2.0' to add GeoParquet 2.0 metadata")
 
         if bbox_info["has_bbox_column"]:
@@ -633,6 +640,11 @@ def _check_geoparquet_v1(
         and not needs_bbox_metadata
         and not cannot_declare_covering
     )
+    # Everything above is advice except a covering the file *declares* and the
+    # spec rejects: a pre-1.1 covering, or one over an illegal struct (#1241).
+    declares_rejected_covering = has_illegal_covering or (
+        cannot_declare_covering and bbox_info["has_bbox_metadata"] and covering_supported(version)
+    )
 
     # Always suggest v2.0 upgrade for v1.x files
     recommendations.append(
@@ -652,10 +664,12 @@ def _check_geoparquet_v1(
         if bbox_info["has_bbox_column"]:
             if has_illegal_covering:
                 error(
-                    f"❌ Found bbox column '{bbox_info['bbox_column_name']}' with covering "
+                    f"✗ Found bbox column '{bbox_info['bbox_column_name']}' with covering "
                     f"metadata, but 'covering' requires GeoParquet 1.1+ (this file is {version}) "
                     "— run 'gpio check spec' for details"
                 )
+            elif cannot_declare_covering and declares_rejected_covering:
+                error(f"✗ {issues[-1]}. {BBOX_REWRITE_HINT}")
             elif cannot_declare_covering:
                 warn(
                     f"⚠️  {issues[-2] if has_illegal_covering else issues[-1]}. {BBOX_REWRITE_HINT}"
@@ -676,7 +690,7 @@ def _check_geoparquet_v1(
                     f"key that advertises it needs GeoParquet 1.1+ (this file is {version})"
                 )
         else:
-            error("❌ No bbox column found (recommended for better performance)")
+            warn("⚠️  No bbox column found (recommended for better performance)")
 
         info(
             "ℹ️  GeoParquet 2.0 is available, with native spatial stats and filter pushdown. "
@@ -686,6 +700,7 @@ def _check_geoparquet_v1(
     if return_results:
         return {
             "passed": passed,
+            SEVERITY_KEY: severity(passed, failure=declares_rejected_covering),
             "file_type": "geoparquet_v1",
             "has_geo_metadata": True,
             "version": version,
@@ -754,10 +769,11 @@ def check_metadata_and_bbox(
 
     # Unknown file type - no geo indicators found
     if not quiet:
-        error("\n❌ No GeoParquet metadata found")
+        error("\n✗ No GeoParquet metadata found")
     if return_results:
         return {
             "passed": False,
+            SEVERITY_KEY: severity(False, failure=True),
             "file_type": "unknown",
             "has_geo_metadata": False,
             "issues": ["No GeoParquet metadata or native Parquet geo types found"],
@@ -807,7 +823,7 @@ def check_covering_encoding(
         recommendations.append("Drop the unusable covering: gpio check all --fix")
         if not quiet:
             error(
-                f"\n❌ Covering on {named} declares no 'bbox' — readers that use the covering "
+                f"\n✗ Covering on {named} declares no 'bbox' — readers that use the covering "
                 "(geopandas among them) cannot open this file at all"
             )
     elif verbose and not quiet:
@@ -816,11 +832,43 @@ def check_covering_encoding(
     if return_results:
         return {
             "passed": not columns,
+            # A reader cannot open the file at all: a failure, not advice.
+            SEVERITY_KEY: severity(not columns, failure=True),
             "issues": issues,
             "recommendations": recommendations,
             "bboxless_covering_columns": columns,
             "fix_available": bool(columns),
         }
+
+
+def check_bbox(parquet_file, verbose=False, return_results=False, quiet=False):
+    """``gpio check bbox``: the bbox column and metadata, and a covering readers can use.
+
+    :func:`check_metadata_and_bbox` and :func:`check_covering_encoding`, judged
+    together, each issue keeping its own check's severity -- a covering with no
+    ``bbox`` member fails the file here as it does in ``check all``. The keys
+    are :func:`check_metadata_and_bbox`'s, so ``--fix`` still repairs the bbox
+    column only; the covering's repair is ``check all --fix``'s.
+    """
+    geo_meta = get_geo_metadata(parquet_file)
+    bbox = check_metadata_and_bbox(
+        parquet_file, verbose, return_results=True, quiet=quiet, geo_meta=geo_meta
+    )
+    covering = check_covering_encoding(
+        parquet_file, verbose, return_results=True, quiet=quiet, geo_meta=geo_meta
+    )
+    if not return_results:
+        return None
+    combined = combine_results([bbox, covering])
+    return {
+        **bbox,
+        "passed": bbox["passed"] and covering["passed"],
+        SEVERITY_KEY: combined[SEVERITY_KEY],
+        "issues": combined["issues"],
+        ISSUE_SEVERITY_KEY: combined[ISSUE_SEVERITY_KEY],
+        "recommendations": [*bbox.get("recommendations", []), *covering["recommendations"]],
+        "bboxless_covering_columns": covering["bboxless_covering_columns"],
+    }
 
 
 def check_compression(parquet_file, verbose=False, return_results=False, quiet=False):
@@ -843,10 +891,11 @@ def check_compression(parquet_file, verbose=False, return_results=False, quiet=F
     primary_col = find_primary_geometry_column(parquet_file, verbose)
     if not primary_col:
         if not quiet:
-            error("\n❌ No geometry column found")
+            error("\n✗ No geometry column found")
         if return_results:
             return {
                 "passed": False,
+                SEVERITY_KEY: severity(False, failure=True),
                 "current_compression": None,
                 "geometry_column": None,
                 "issues": ["No geometry column found"],
