@@ -6,6 +6,7 @@ with appropriate extensions loaded for GeoParquet operations.
 """
 
 import datetime
+import itertools
 import os
 import re
 import shutil
@@ -987,6 +988,183 @@ def _apply_connection_limits(
         con.execute(f"SET threads = {cap}")
 
 
+_PROFILE_ENV_VAR = "GPIO_DUCKDB_PROFILE"
+
+# Values a user reaching for an on/off switch would type. GPIO_DUCKDB_PROFILE
+# names a directory, so one of these is only honoured when that directory
+# already exists; otherwise `=1` would quietly create a ./1/ directory.
+_PROFILE_FLAG_LIKE = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
+
+# Distinguishes connections opened within one process; itertools.count is
+# safe under threads.
+_profile_connection_ids = itertools.count(1)
+
+
+def _profile_file_prefix() -> str:
+    """A per-connection filename prefix that does not collide across processes.
+
+    Microsecond time plus PID plus a random token: the PID alone repeats
+    across containers (often PID 1), and second resolution repeats within a
+    run. The connection counter keeps the names in opening order.
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    token = uuid.uuid4().hex[:6]
+    return f"gpio-profile-{stamp}-p{os.getpid()}-{token}-c{next(_profile_connection_ids)}"
+
+
+def _ensure_profile_directory(directory: str) -> OSError | None:
+    """Create *directory* if missing and probe that a file can be written.
+
+    Returns the ``OSError`` that made it unusable, or ``None`` when usable.
+    """
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".gpio-profile-probe-"):
+            pass
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _profile_directory() -> str | None:
+    """The usable ``GPIO_DUCKDB_PROFILE`` directory, or ``None`` (profiling off).
+
+    The path is resolved to an absolute path here, once, so a later
+    ``os.chdir`` cannot move it. An unusable path (or a flag-like value such
+    as ``1``/``true`` that is not an existing directory) warns and returns
+    ``None`` rather than raising: DuckDB fails *every* query on a connection
+    whose ``profiling_output`` cannot be written (an InternalException at fetch
+    time), so profiling must be refused up front — it may never break the
+    actual work.
+    """
+    raw = os.environ.get(_PROFILE_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    if raw.lower() in _PROFILE_FLAG_LIKE and not os.path.isdir(raw):
+        warn(
+            f"GPIO_DUCKDB_PROFILE={raw!r} looks like an on/off flag, but it names the "
+            "directory to write DuckDB profiles into (e.g. GPIO_DUCKDB_PROFILE=profiles); "
+            "continuing without DuckDB profiling"
+        )
+        return None
+    directory = os.path.abspath(raw)
+    exc = _ensure_profile_directory(directory)
+    if exc is not None:
+        warn(
+            f"GPIO_DUCKDB_PROFILE={raw!r} is not a writable directory ({exc}); "
+            "continuing without DuckDB profiling"
+        )
+        return None
+    return directory
+
+
+class ProfiledConnection:
+    """A DuckDB connection whose queries each write their own JSON profile.
+
+    DuckDB's ``profiling_output`` setting names *one* file, and each profiled
+    statement overwrites it, so a fixed path would keep only the last query's
+    profile. This wrapper re-points ``profiling_output`` at a fresh file in
+    the ``GPIO_DUCKDB_PROFILE`` directory before every ``execute``,
+    ``executemany`` and ``sql`` call; a ``SET`` writes no profile itself, so
+    the rotation never clobbers anything, and a name already on disk is
+    skipped, so no existing file is overwritten by a rotation.
+
+    What gets captured is decided by DuckDB, not by this wrapper: DuckDB
+    writes a statement's profile only when its result is *fully consumed*
+    (``fetchall()``, ``.arrow().read_all()``, a ``COPY``, a ``fetchone()``
+    read until it returns ``None``). A result read with a single
+    ``fetchone()``, or abandoned when the next statement runs, writes no
+    profile. DDL and ``SET`` write none either. So a command's profile
+    directory holds its result-draining queries — usually the heavy ones —
+    not every statement it ran.
+
+    A lazy relation from ``sql()`` executes when it is fetched, and DuckDB
+    writes its profile to whichever file is current *then*: fetched straight
+    away it gets its own file, but fetched after another statement it
+    replaces that statement's profile (DuckDB overwrites its output file, and
+    no hook runs before a relation executes).
+
+    Before each rotation the directory is re-checked (and re-created if it
+    was deleted). If it can no longer be written, profiling is switched off
+    on this connection with a single warning, so profiling never breaks the
+    work. A directory removed, or a disk filled, *during* a statement still
+    fails that statement at fetch time; it is not retried, because the
+    statement's side effects (a ``COPY`` file, say) have already happened.
+
+    ``cursor()`` returns a profiled cursor (a cursor is a new DuckDB session
+    and would not inherit the setting). Everything else delegates to the
+    wrapped connection. It is a proxy, not a ``DuckDBPyConnection`` subclass:
+    ``isinstance(con, duckdb.DuckDBPyConnection)`` is False for it, and it
+    cannot be handed to a DuckDB API that takes ``connection=``. gpio does
+    neither, which is why returning it from :func:`get_duckdb_connection` is
+    safe.
+    """
+
+    def __init__(self, con: "duckdb.DuckDBPyConnection", directory: str):
+        self._con = con
+        self._directory = directory
+        self._prefix = _profile_file_prefix()
+        self._statement_ids = itertools.count(1)
+        self._enabled = True
+        # Order matters: DuckDB rejects a .json profiling_output until
+        # enable_profiling is 'json'. The window between the two SETs is safe
+        # because SET statements are themselves never profiled.
+        con.execute("SET enable_profiling = 'json';")
+        self._rotate_profile_output()
+
+    def _directory_usable(self) -> bool:
+        if os.path.isdir(self._directory) and os.access(self._directory, os.W_OK):
+            return True
+        exc = _ensure_profile_directory(self._directory)
+        if exc is None:
+            return True
+        self._enabled = False
+        self._con.execute("PRAGMA disable_profiling;")
+        warn(
+            f"GPIO_DUCKDB_PROFILE directory {self._directory!r} is no longer writable "
+            f"({exc}); DuckDB profiling is off for the rest of this connection"
+        )
+        return False
+
+    def _rotate_profile_output(self) -> None:
+        if not self._enabled or not self._directory_usable():
+            return
+        while True:
+            name = f"{self._prefix}-q{next(self._statement_ids):04d}.json"
+            target = os.path.join(self._directory, name)
+            if not os.path.exists(target):
+                break
+        self._con.execute(f"SET profiling_output = '{_escape_sql_string(target)}';")
+
+    def execute(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.executemany(*args, **kwargs)
+
+    def sql(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.sql(*args, **kwargs)
+
+    def cursor(self):
+        cur = self._con.cursor()
+        if not self._enabled:
+            return cur
+        return ProfiledConnection(cur, self._directory)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def __enter__(self):
+        self._con.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._con.__exit__(*exc_info)
+
+
 def get_duckdb_connection(
     load_spatial=True,
     load_httpfs=None,
@@ -1037,8 +1215,24 @@ def get_duckdb_connection(
                     ``threads`` to what it affords (``_apply_connection_limits``);
                     a value given here is used as given.
 
+    Environment:
+        GPIO_DUCKDB_PROFILE: a directory path (resolved to an absolute path
+            when the connection opens). When set, the connection runs with
+            ``enable_profiling = 'json'`` and writes one profile file per
+            fully consumed query into that directory (created if missing),
+            named ``gpio-profile-<time>-p<pid>-<token>-c<n>-q<n>.json``; see
+            :class:`ProfiledConnection` for which statements DuckDB profiles.
+            An unusable path, or a flag-like value such as ``1``/``true`` that
+            is not an existing directory, warns and profiling is skipped; the
+            work itself is not failed by profiling.
+
     Returns:
-        duckdb.DuckDBPyConnection: Configured connection with extensions loaded
+        duckdb.DuckDBPyConnection | ProfiledConnection: Configured connection
+        with extensions loaded. When GPIO_DUCKDB_PROFILE names a usable
+        directory it is a :class:`ProfiledConnection`, a proxy that delegates
+        to the DuckDB connection (it is not a subclass). The return is left
+        unannotated because the many helpers typed ``duckdb.DuckDBPyConnection``
+        that receive it use only the methods the proxy forwards.
     """
     config = {}
     if threads is not None:
@@ -1104,6 +1298,13 @@ def get_duckdb_connection(
     if eff_region:
         safe_region = _escape_sql_string(eff_region)
         con.execute(f"SET s3_region='{safe_region}';")
+
+    # GPIO_DUCKDB_PROFILE=<dir>: wrap the connection (after all setup, so the
+    # setup statements above are not profiled) to write one JSON profile per
+    # query into <dir>. An unusable directory warned and returned None.
+    profile_dir = _profile_directory()
+    if profile_dir is not None:
+        return ProfiledConnection(con, profile_dir)
 
     return con
 
@@ -1192,7 +1393,7 @@ def get_duckdb_connection_for_s3(
     s3_endpoint: str | None = None,
     s3_region: str | None = None,
     s3_use_ssl: bool | None = None,
-) -> "duckdb.DuckDBPyConnection":
+) -> "duckdb.DuckDBPyConnection | ProfiledConnection":
     """
     Get DuckDB connection configured for S3 access.
 
@@ -1208,7 +1409,9 @@ def get_duckdb_connection_for_s3(
         s3_use_ssl: Whether to use SSL for the S3 endpoint
 
     Returns:
-        duckdb.DuckDBPyConnection: Configured connection with appropriate S3 access
+        duckdb.DuckDBPyConnection | ProfiledConnection: Configured connection
+        with appropriate S3 access (a ProfiledConnection proxy when
+        GPIO_DUCKDB_PROFILE is set; see :func:`get_duckdb_connection`)
     """
 
     s3_kwargs = {"s3_endpoint": s3_endpoint, "s3_region": s3_region, "s3_use_ssl": s3_use_ssl}
