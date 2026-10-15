@@ -678,6 +678,17 @@ Validates file structure and metadata against the GeoParquet specification:
   them. Both use the whole file's statistics — the union over every row group,
   not the first one's — so a correctly written multi-row-group file passes
   (#721).
+- **GEOGRAPHY bounding boxes** — a `GEOGRAPHY` column's row-group boxes must
+  be finite and stay in the canonical ranges, X in [-180, 180] and Y in
+  [-90, 90] (`geography_stats_bbox_*` **fails** otherwise; `xmin > xmax`
+  passes as the antimeridian wrap, RFC 7946 §5.2). With data validation on,
+  `geography_stats_cover_edges_*` **warns** when a row group's box does not
+  contain its own sampled geometries' geodesic edges — the great-circle (or
+  ellipsoidal) bulge included — because a reader pruning row groups by such a
+  box can skip rows that really match. Each row group is judged on its own,
+  so a bad box cannot hide behind a file-wide union, and the edges are
+  densified independently with `pyproj.Geod` rather than by gpio's writer.
+  gpio's own 2.0 GEOGRAPHY outputs pass both.
 
 **Exit codes:** `0` when no check failed, `1` when one did; warnings exit `0`,
 or `1` with `--strict` (see [Exit Codes](#exit-codes)). `check spec` used to
