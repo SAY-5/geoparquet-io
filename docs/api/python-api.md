@@ -821,6 +821,26 @@ themselves ([#1176](https://github.com/geoparquet/geoparquet-io/issues/1176)).
 A table with *no* geometry column is not the same thing, and still writes plain
 Parquet deliberately.
 
+**What `write()` keeps**
+
+`write()` keeps the input's non-geo file metadata (fiboa, vecorel, STAC
+fragments, your own keys), for a table from `gpio.read()` and from
+`gpio.convert()` alike
+([#1268](https://github.com/geoparquet/geoparquet-io/issues/1268)). The stale
+`pandas` and `ARROW:schema` blocks are dropped on purpose, and `geo` is rebuilt
+from the table. Non-planar edges are kept too. A native GEOGRAPHY table writes
+as a GEOGRAPHY at 2.0 and as `edges: spherical` in a 1.x `geo` block
+([#1253](https://github.com/geoparquet/geoparquet-io/issues/1253)). A
+`1.1-geoarrow` output also names the edges in its GeoArrow type, so an Arrow
+reader sees the same answer. No WKB geometry column, primary or secondary,
+is dictionary-encoded, on any `write_strategy` and any `geoparquet_version`
+([#1122](https://github.com/geoparquet/geoparquet-io/issues/1122)).
+
+```python
+gpio.convert('fields.parquet').write('out.parquet')  # keeps the fiboa key
+gpio.read('geography.parquet').write('out.parquet', geoparquet_version='2.0')
+```
+
 **Row group size**
 
 `row_group_rows` is resolved by the same write facade the CLI uses, so a number

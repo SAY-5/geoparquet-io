@@ -32,6 +32,8 @@ from geoparquet_io.core.arrow_geo_metadata import (
     _apply_geoparquet_metadata,
     _normalize_arrow_large_types,
     _write_table_with_settings,
+    nonplanar_edges_from_schema,
+    with_planar_edge_types,
 )
 from geoparquet_io.core.compression import validate_compression_settings
 from geoparquet_io.core.crs_utils import (
@@ -62,6 +64,7 @@ from geoparquet_io.core.duckdb_utils import (
 from geoparquet_io.core.exceptions import InvalidParameterError
 from geoparquet_io.core.file_utils import is_partition_path
 from geoparquet_io.core.geo_metadata import (
+    GEOGRAPHY_EDGE_ALGORITHMS,
     GEOPARQUET_VERSIONS,
     SELF_EVIDENT_BBOX_COLUMN,
     carried_geometry_column,
@@ -161,11 +164,11 @@ def _edges_for_output_version(edges: str, geo_version: str) -> str:
     return "spherical"
 
 
-def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> dict[str, str]:
-    """Map geometry column -> non-planar edges declared in an input KV metadata dict.
+def _block_edges(original_metadata: dict | None) -> dict[str, object]:
+    """Map geometry column -> the ``edges`` value its ``geo`` block states, as written.
 
-    Fallback for write paths that carry the input's KV metadata but not its
-    path (the native GEOGRAPHY logical-type half needs the file itself).
+    A column whose block has no ``edges`` key is left out: it says nothing.
+    An unreadable block reads as empty.
     """
     if not original_metadata:
         return {}
@@ -176,17 +179,29 @@ def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> di
         if isinstance(geo_data, bytes):
             geo_data = geo_data.decode("utf-8")
         geo_meta = json.loads(geo_data) if isinstance(geo_data, str) else geo_data
-        edges_by_col: dict[str, str] = {}
-        for name, col_meta in (geo_meta.get("columns") or {}).items():
-            edges = col_meta.get("edges") if isinstance(col_meta, dict) else None
-            if edges and edges != "planar":
-                edges_by_col[name] = edges
-        return edges_by_col
+        return {
+            name: col_meta["edges"]
+            for name, col_meta in (geo_meta.get("columns") or {}).items()
+            if isinstance(col_meta, dict) and "edges" in col_meta
+        }
     except Exception:
         return {}
 
 
-def _apply_nonplanar_edges(
+def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> dict[str, str]:
+    """Map geometry column -> non-planar edges declared in an input KV metadata dict.
+
+    Fallback for write paths that carry the input's KV metadata but not its
+    path (the native GEOGRAPHY logical-type half needs the file itself).
+    """
+    return {
+        name: edges
+        for name, edges in _block_edges(original_metadata).items()
+        if edges and edges != "planar"
+    }
+
+
+def apply_nonplanar_edges(
     edges_by_col: dict[str, str],
     output_file: str,
     compression: str = "ZSTD",
@@ -252,6 +267,9 @@ def _apply_nonplanar_edges(
         force=pending_geo is not None,
         unbounded=set(targets) - set(file_bboxes),
     )
+    # A 1.x output has no GEOGRAPHY type to carry the edges, so a GeoArrow
+    # column's embedded Arrow schema is stamped instead, or it says planar.
+    arrow_edges = edges_by_col if geo_version.startswith("1.") else None
 
     try:
         retyped = patch_footer(
@@ -259,6 +277,7 @@ def _apply_nonplanar_edges(
             geo_updates,
             geography=geography,
             geography_bbox=geography_bbox,
+            arrow_edges=arrow_edges,
             verbose=verbose,
         )
     except FooterPatchRaced:
@@ -277,7 +296,7 @@ def _apply_nonplanar_edges(
                 row_group_rows,
             )
 
-    if geo_meta is None and not retyped:
+    if geo_meta is None and not retyped and not _already_geography(output_file, edges_by_col):
         warn(
             "Input declares non-planar edges but output has no geo metadata or "
             f"GEOGRAPHY column to carry them ({', '.join(sorted(edges_by_col))}). "
@@ -288,6 +307,16 @@ def _apply_nonplanar_edges(
             f"Kept non-planar edges for {', '.join(sorted(edges_by_col))}"
             + (f"; retyped GEOGRAPHY: {', '.join(retyped)}" if retyped else "")
         )
+
+
+def _already_geography(output_file: str, edges_by_col: dict[str, str]) -> bool:
+    """Whether every edge column is already a GEOGRAPHY, so its type carries the edges."""
+    geography = {
+        col["name"]
+        for col in root_schema_columns(get_schema_info(output_file))
+        if "GeographyType" in (col.get("logical_type") or "")
+    }
+    return set(edges_by_col) <= geography
 
 
 def _geography_candidates(output_file: str, edges_by_col: dict[str, str]) -> dict[str, str]:
@@ -1523,7 +1552,7 @@ def write_parquet_with_metadata(
         # invalidated (#601) were excluded at collection rather than
         # re-attached. The fast path's deferred V2 geo repair rides along, so
         # both edits cost one footer patch (#1270).
-        _apply_nonplanar_edges(
+        apply_nonplanar_edges(
             edges_to_restore,
             actual_output,
             compression=compression,
@@ -1573,13 +1602,40 @@ def _edges_to_restore(
     ``exclude_columns``: columns whose declaration the write itself invalidated
     (#601). The input still declares them, but they must not come back.
 
-    Collection only; :func:`_apply_nonplanar_edges` writes the answer back
+    Collection only; :func:`apply_nonplanar_edges` writes the answer back
     after the write, on any rewrite path.
     """
     edges_by_col = declared_nonplanar_edges(input_file, original_metadata)
     if exclude_columns:
         edges_by_col = {k: v for k, v in edges_by_col.items() if k not in exclude_columns}
     return edges_by_col
+
+
+def table_nonplanar_edges(table, geometry_column: str, edges: str | None) -> dict[str, str]:
+    """Map geometry column -> non-planar edges an in-memory table declares.
+
+    The one reader of a table's edges (the repair gate's
+    ``geometry_repair.nonplanar_edges_of_arrow_table`` is a view of it). The
+    caller's ``edges`` wins for the primary, then the carried ``geo`` block,
+    then a GeoArrow field's own edge type. A block that states ``edges`` wins
+    over the type when they disagree, ``"planar"`` included. A block without
+    ``edges`` says nothing, so the type decides. Only a GeoParquet edge
+    algorithm (``GEOGRAPHY_EDGE_ALGORITHMS``) counts as a declaration, so a
+    typo falls through to the type (#1288). An explicit ``"planar"`` from the
+    caller is a choice too, so it drops the primary. The table is the only
+    witness the Arrow funnel has, since it never sees the input file.
+    """
+    edges_by_col = nonplanar_edges_from_schema(table.schema)
+    for name, declared in _block_edges(table.schema.metadata).items():
+        if declared == "planar":
+            edges_by_col.pop(name, None)
+        elif declared in GEOGRAPHY_EDGE_ALGORITHMS:
+            edges_by_col[name] = declared
+    if edges == "planar":
+        edges_by_col.pop(geometry_column, None)
+    elif edges:
+        edges_by_col[geometry_column] = edges
+    return {name: e for name, e in edges_by_col.items() if name in table.column_names}
 
 
 def _auto_fix_vecorel_if_needed(
@@ -1684,6 +1740,14 @@ def write_geoparquet_table(
     # Normalize large_string/large_binary back to string/binary for Parquet compatibility
     table = _normalize_arrow_large_types(table)
 
+    # Read before the metadata pass rebuilds the column: a 1.x write strips the
+    # GeoArrow edge type, and a 2.0 one regenerates a block without `edges`.
+    edges_by_col = table_nonplanar_edges(table, geometry_column, edges) if has_geometry else {}
+    if has_geometry and edges == "planar":
+        # An explicit planar choice also clears a native GEOGRAPHY type, which
+        # a 2.0 write would otherwise keep as spherical.
+        table = with_planar_edge_types(table, [geometry_column])
+
     # No AWS_PROFILE env mutation here: the write target inside this block is a
     # local (temp) file, and the upload at the end is credentialed by passing
     # profile= straight through to upload().
@@ -1717,6 +1781,18 @@ def write_geoparquet_table(
             row_group_size_mb=row_group_size_mb,
             geoparquet_version=geoparquet_version,
             geometry_column=geometry_column,
+            verbose=verbose,
+        )
+
+        # The DuckDB-query funnel restores edges in `_preserve_edges_after_write`.
+        # This is the same step for a table: the block's `edges` and, at 2.0,
+        # the GEOGRAPHY logical type, so the two never disagree (#1269).
+        apply_nonplanar_edges(
+            edges_by_col,
+            actual_output,
+            compression=validated_compression or "UNCOMPRESSED",
+            compression_level=validated_level,
+            row_group_rows=row_group_rows,
             verbose=verbose,
         )
 
