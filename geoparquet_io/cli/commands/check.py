@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import click
+from click.core import ParameterSource
 
 from geoparquet_io.cli._shared import _activate_s3, create_default_group, init_group_context
 from geoparquet_io.cli.decorators import (
@@ -36,6 +37,7 @@ from geoparquet_io.cli.decorators import (
     verbose_option,
 )
 from geoparquet_io.cli.fix_helpers import NoBackupConfirmation, handle_fix_common
+from geoparquet_io.core.check_bbox_values import DEFAULT_BBOX_SAMPLE_ROWS
 from geoparquet_io.core.check_parquet_structure import CheckProfile
 from geoparquet_io.core.check_parquet_structure import check_all as check_structure_impl
 from geoparquet_io.core.check_spatial_order import SPATIAL_ORDER_CHECK
@@ -164,6 +166,8 @@ class MultiFileCheckRunner:
         self.strict = strict
         #: Each file's verdict -- after its fix, when one was applied.
         self.verdicts: dict[str, Verdict] = {}
+        #: The re-check of each fixed file, behind its post-fix verdict.
+        self.rechecks: dict[str, dict] = {}
         self.verbose = verbose
         self.max_issues_shown = max_issues_shown
         self.fix_output = fix_output
@@ -261,6 +265,35 @@ class MultiFileCheckRunner:
             self._echo_could_not_run(file_path, line)
         verdict = result_verdict(result)
         self.verdicts[file_path] = Verdict.FAILURE if self.errored(file_path) else verdict
+        self.rechecks[file_path] = result
+
+    def echo_fixed(
+        self, file_path: str, applied: tuple[str, str | None], success: str, action: str
+    ) -> None:
+        """What ``--fix`` wrote, judged by its re-check -- never "success" for a file that fails.
+
+        A fix can repair one thing and leave another: ``check bbox --fix`` adds
+        a missing covering but cannot recompute wrong values. Then it says what
+        it did, that the file still fails, each failure, and the repair to run.
+        """
+        output_path, backup_path = applied
+        still_fails = self.verdicts.get(file_path) is Verdict.FAILURE
+        if still_fails:
+            click.echo(
+                click.style(f"\n{WARNING_GLYPH} {action}, but the file still fails:", fg="yellow")
+            )
+            result = self.rechecks.get(file_path, {})
+            for level, issue in labelled_issues(result):
+                if level is Verdict.FAILURE:
+                    click.echo(click.style(f"  {FAILURE_GLYPH} {issue}", fg="red"))
+            recommendations = result.get("recommendations") or []
+            if recommendations:
+                click.echo(f"  {recommendations[0]}")
+        else:
+            click.echo(click.style(f"\n{PASS_GLYPH} {success}", fg="green"))
+        click.echo(f"{'Written to' if still_fails else 'Optimized file'}: {output_path}")
+        if backup_path:
+            click.echo(f"Backup: {backup_path}")
 
     def finish(self) -> None:
         """Summarize the run and exit with its code: the one place a check run ends."""
@@ -1111,19 +1144,13 @@ def check_spatial(
                         path, random_sample_size, limit_rows, False, quiet=True
                     ),
                 )
-                if applied is None:
-                    continue
-                output_path, backup_path = applied
-
-                if show_output:
-                    click.echo(
-                        click.style(
-                            f"\n{PASS_GLYPH} Spatial ordering applied successfully!", fg="green"
-                        )
+                if applied is not None and show_output:
+                    runner.echo_fixed(
+                        file_path,
+                        applied,
+                        "Spatial ordering applied successfully!",
+                        "Applied Hilbert spatial ordering",
                     )
-                    click.echo(f"Optimized file: {output_path}")
-                    if backup_path:
-                        click.echo(f"Backup: {backup_path}")
 
         # Print summary for multi-file checks, and exit with the run's code
         runner.finish()
@@ -1218,22 +1245,25 @@ def check_compression_cmd(
                     verbose=verbose,
                     recheck=quiet_recheck(check_compression, False),
                 )
-                if applied is None:
-                    continue
-                output_path, backup_path = applied
-
-                if show_output:
-                    click.echo(
-                        click.style(
-                            f"\n{PASS_GLYPH} Compression optimized successfully!", fg="green"
-                        )
+                if applied is not None and show_output:
+                    runner.echo_fixed(
+                        file_path,
+                        applied,
+                        "Compression optimized successfully!",
+                        "Re-compressed with ZSTD",
                     )
-                    click.echo(f"Optimized file: {output_path}")
-                    if backup_path:
-                        click.echo(f"Backup: {backup_path}")
 
         # Print summary for multi-file checks, and exit with the run's code
         runner.finish()
+
+
+def _bbox_fix_action(needs_column: bool, needs_metadata: bool) -> str:
+    """What ``check bbox --fix`` did to a 1.x file, for the line that reports it."""
+    if needs_column:
+        return "Added the bbox column and its covering metadata"
+    if needs_metadata:
+        return "Added the bbox covering metadata"
+    return "Rewrote the bbox column"
 
 
 @check.command(name="bbox", cls=GlobAwareCommand)
@@ -1256,6 +1286,18 @@ def check_compression_cmd(
     is_flag=True,
     help="Skip .bak backup when fixing",
 )
+@click.option(
+    "--sample-rows",
+    type=click.IntRange(min=0),
+    default=DEFAULT_BBOX_SAMPLE_ROWS,
+    show_default=True,
+    help="Rows to compare bbox values against geometry (0 to skip that comparison)",
+)
+@click.option(
+    "--all-rows",
+    is_flag=True,
+    help="Compare every row's bbox against its geometry, not a sample",
+)
 @overwrite_option
 @strict_option
 @check_partition_options
@@ -1267,6 +1309,8 @@ def check_bbox_cmd(
     fix,
     fix_output,
     no_backup,
+    sample_rows,
+    all_rows,
     overwrite,
     check_all_files,
     check_sample,
@@ -1277,12 +1321,30 @@ def check_bbox_cmd(
     For GeoParquet 1.x: bbox column is recommended for spatial filtering.
     For GeoParquet 2.0/parquet-geo-only: bbox column is NOT recommended
     (native Parquet geo types provide row group statistics).
+
+    Also compares each row's bbox against its geometry's real envelope. A bbox
+    that does not cover its geometry is a failure -- readers prune on the
+    covering, so those rows go missing from spatial query results with no error
+    anywhere -- as are a NULL or NaN bbox and a geometry that is not valid WKB.
+    A bbox larger than its geometry is a warning: readers over-fetch, but the
+    answer stays right.
+
+    The comparison decodes a seeded random sample (--sample-rows) or every row
+    (--all-rows); either way the geometry and bbox columns are read in full.
+    --fix repairs the column and metadata, not the values, so its output is
+    compared again and a wrong bbox still fails the run.
+
+    Exits 1 if any check fails, or on a warning with --strict.
     """
     from geoparquet_io.core.check_fixes import fix_bbox_all, fix_bbox_removal
     from geoparquet_io.core.check_parquet_structure import check_bbox
 
     configure_verbose(verbose)
-    bbox_recheck = quiet_recheck(check_bbox, False)
+    if all_rows and ctx.get_parameter_source("sample_rows") is not ParameterSource.DEFAULT:
+        raise click.UsageError(
+            "--all-rows compares every row; it cannot be combined with --sample-rows"
+        )
+    bbox_recheck = quiet_recheck(check_bbox, False, verify_rows=sample_rows, all_rows=all_rows)
 
     with _activate_s3(ctx):
         runner = begin_check_run(
@@ -1310,6 +1372,8 @@ def check_bbox_cmd(
                     verbose and show_output,
                     return_results=True,
                     quiet=quiet,
+                    verify_rows=sample_rows,
+                    all_rows=all_rows,
                 ),
             )
             if result is None:
@@ -1340,19 +1404,13 @@ def check_bbox_cmd(
                     applied = runner.fix_file(
                         file_path, bbox_fix_func, verbose=verbose, recheck=bbox_recheck
                     )
-                    if applied is None:
-                        continue
-                    output_path, backup_path = applied
-
-                    if show_output:
-                        click.echo(
-                            click.style(
-                                f"\n{PASS_GLYPH} Bbox column removed successfully!", fg="green"
-                            )
+                    if applied is not None and show_output:
+                        runner.echo_fixed(
+                            file_path,
+                            applied,
+                            "Bbox column removed successfully!",
+                            "Removed the bbox column",
                         )
-                        click.echo(f"Optimized file: {output_path}")
-                        if backup_path:
-                            click.echo(f"Backup: {backup_path}")
                 else:
                     # V1.x: add bbox column/metadata (existing logic)
                     needs_column = result.get("needs_bbox_column", False)
@@ -1378,17 +1436,13 @@ def check_bbox_cmd(
                     applied = runner.fix_file(
                         file_path, bbox_fix_func, verbose=verbose, recheck=bbox_recheck
                     )
-                    if applied is None:
-                        continue
-                    output_path, backup_path = applied
-
-                    if show_output:
-                        click.echo(
-                            click.style(f"\n{PASS_GLYPH} Bbox optimized successfully!", fg="green")
+                    if applied is not None and show_output:
+                        runner.echo_fixed(
+                            file_path,
+                            applied,
+                            "Bbox optimized successfully!",
+                            _bbox_fix_action(needs_column, needs_metadata),
                         )
-                        click.echo(f"Optimized file: {output_path}")
-                        if backup_path:
-                            click.echo(f"Backup: {backup_path}")
 
         # Print summary for multi-file checks, and exit with the run's code
         runner.finish()
@@ -1492,19 +1546,13 @@ def check_row_group_cmd(
                     verbose=verbose,
                     recheck=quiet_recheck(check_row_groups, False, profile=profile),
                 )
-                if applied is None:
-                    continue
-                output_path, backup_path = applied
-
-                if show_output:
-                    click.echo(
-                        click.style(
-                            f"\n{PASS_GLYPH} Row groups optimized successfully!", fg="green"
-                        )
+                if applied is not None and show_output:
+                    runner.echo_fixed(
+                        file_path,
+                        applied,
+                        "Row groups optimized successfully!",
+                        "Rewrote the row groups",
                     )
-                    click.echo(f"Optimized file: {output_path}")
-                    if backup_path:
-                        click.echo(f"Backup: {backup_path}")
 
         # Print summary for multi-file checks, and exit with the run's code
         runner.finish()

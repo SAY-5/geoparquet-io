@@ -213,6 +213,7 @@ Verifies:
 - Bbox column structure
 - GeoParquet metadata version
 - Bbox covering metadata
+- That each row's bbox really covers that row's geometry
 
 A bbox column is optional in GeoParquet 2.0, but it must be declared, and the
 declaration must be true:
@@ -230,6 +231,142 @@ declaration must be true:
 well-formed, column present, struct shape, field types — at GeoParquet 1.1
 **and** 2.0. The last four were previously gated to 1.1 only, so an identical
 broken covering failed at 1.1 and passed at 2.0.
+
+#### Does the bbox cover the geometry?
+
+The checks above all read the footer. They say the column is there and that the
+`covering` points at it — not that its numbers are right. A bbox column is a
+*copy* of information the geometry already holds, so any operation that rewrites
+geometry without rewriting the copy leaves a file that passes every metadata
+check while describing geometry it no longer has. Simplifying one partition of a
+published catalogue with Douglas-Peucker at 0.0002° moved a bbox extreme on
+135,712 of its 435,138 rows; `gpio check spec` still reported 29 passed, 0
+failed.
+
+So `check bbox` compares the numbers too, and the two ways to be wrong are not
+the same finding:
+
+- **A bbox smaller than its geometry fails the check.** The whole point of a
+  covering is that a reader can prune row groups and pages without decoding
+  geometry, so an undersized box makes that pruning drop rows that genuinely
+  intersect the query window. Nothing raises; the reader just gets less data
+  than the file holds and cannot tell.
+- **A bbox larger than its geometry is a warning.** The reader over-fetches and
+  re-filters on the real geometry, so the answer stays right. It costs time, not
+  correctness.
+- **A NULL bbox beside a non-NULL geometry fails**, for the same reason an
+  undersized one does: every comparison against NULL is NULL, so a
+  covering-based filter drops the row. A bbox struct that is present but has a
+  NULL in any of its four fields is a NULL bbox, and a NaN in one fails the same
+  way — no filter can match it.
+- **A geometry value that is not valid WKB fails** — zero-length or unparsable
+  bytes. No reader can decode it, and its bbox cannot be checked. It is counted
+  on its own; the rows around it are still compared (including the other rows
+  of a dictionary-encoded page, which DuckDB would otherwise read as NULL).
+
+A row with no geometry — NULL or empty — has no envelope to compare against and
+is counted and skipped. If it still carries a bbox, that is a warning: there is
+nothing for the bbox to describe.
+
+Each finding is reported at its own level, so a file with both an undersized
+and an oversized bbox prints one failure and one warning. A failure exits 1 like
+any other check failure; a file with only warnings exits 0 unless `--strict` is
+set. See [exit codes](#exit-codes) for the shared contract.
+
+**Antimeridian.** On a geographic CRS (including the default, OGC:CRS84), a bbox
+with `xmin > xmax` crosses the antimeridian (RFC 7946, section 5.2): longitudes in
+`[xmin, 180]` or `[-180, xmax]` are inside it, judged per vertex. This is how
+`check spec` reads the file-level `bbox`, so the two agree; the output says how
+many rows were read that way. On a projected CRS, `xmin > xmax` is simply wrong
+and fails as undersized.
+
+**Spherical edges.** The comparison uses the planar envelope of a geometry's
+vertices. For a column whose `edges` are `spherical`, a geodesic edge can bulge
+past that envelope, so the output names the edges and the check is a check on
+the vertices, not on the curve.
+
+The report names the worst offending rows by their position in the file, which
+is the part you can act on:
+
+```
+Bbox vs geometry:
+   5,000 of 435,138 rows checked (a random sample; --all-rows checks every row)
+✗ 1,547 rows where the bbox does not cover its geometry
+   Readers prune on the covering, so these rows are missing from spatial query results with no error anywhere
+   Worst: row 229584 (short by 0.0113), row 81070 (short by 0.00981), ...
+   Regenerate the column: gpio add bbox <input> <output> --force
+```
+
+`--fix` cannot repair this. It adds a missing column or metadata, or drops an
+unusable column; numbers that are wrong have to be recomputed from the
+geometry, which is a rewrite. When `--fix` does apply a metadata repair, it
+compares the values again on what it wrote, so a wrong bbox still fails the run:
+
+```bash
+gpio add bbox --force input.parquet output.parquet
+```
+
+**Cost and sampling.** Comparing means decoding geometry, which the other checks
+never do, so the default is a random sample of 5,000 rows drawn across the whole
+file, large enough that a corruption affecting even 1% of rows is seen with
+overwhelming probability. It is a random sample rather than the first N rows on
+purpose: the realistic corruption is an operation that rewrote part of a file,
+and a head-of-file sample would miss a rewritten tail.
+
+The sample fixes the *decode* cost, not the I/O. Drawing rows from across the
+file means reading the geometry and bbox columns of every row group, so a
+sampled check on a remote file still transfers both columns in full — budget for
+that on a large object-store file. The sample is seeded, so the same file gets
+the same verdict every run, but a passing sample is evidence, not a guarantee: a
+corruption confined to a handful of rows can fall between the sampled ones.
+`--all-rows` compares every row; `--sample-rows N` sets the sample size, and
+`--sample-rows 0` skips the comparison (and says so) and checks structure and
+metadata only.
+
+=== "CLI"
+
+    ```bash
+    # Default: 5,000 rows sampled across the file
+    gpio check bbox myfile.parquet
+
+    # Exhaustive
+    gpio check bbox myfile.parquet --all-rows
+
+    # Wider sample, or none at all
+    gpio check bbox myfile.parquet --sample-rows 50000
+    gpio check bbox myfile.parquet --sample-rows 0
+    ```
+
+=== "Python"
+
+    <!-- doctest: prelude="import geoparquet_io as gpio; table = gpio.read('myfile.parquet')" -->
+    ```python
+    result = table.check_bbox(all_rows=True)
+    if result.verdict() == "failure":
+        for failure in result.failures():
+            print(failure)
+    for warning in result.warnings():  # an oversized bbox, say
+        print(warning)
+
+    # Wider sample, and the per-row report behind the verdict
+    report = table.check_bbox(sample_rows=50000).to_dict()['bbox_values']
+    print(report['undersized_rows'], report['undersized_examples'])
+    ```
+
+**Tolerance.** Exact equality is the wrong test — a bbox that has been through a
+reprojection or a float32 column is not bit-identical to the envelope recomputed
+from the geometry. The slack is four ULP of the bbox column's *own* storage
+type, scaled to the magnitude of the coordinate, with a 1e-9 absolute floor for
+coordinates near zero. A float64 covering is therefore held to about 9e-16
+relative, and a float32 one to about 5e-7: the GeoParquet spec allows a float32
+covering and asks writers to round outward, and writers that round to nearest
+instead put a bound up to half an ULP inside the geometry. That slack is an
+artefact of the column's storage, not a wrong bbox. The comparison is not
+symmetric — it is an undersized box beyond the tolerance that fails.
+
+`check all` does **not** run this comparison. Every other question it asks is
+answered from the footer, so it stays a metadata-only pass; reading geometry
+belongs to the command you ran for it.
 
 #### A covering with no `bbox` member
 
@@ -592,6 +729,10 @@ Validates STAC Item or Collection JSON:
 
     # Custom sampling for spatial check
     gpio check spatial myfile.parquet --random-sample-size 200 --limit-rows 1000000
+
+    # Custom sampling for the bbox-vs-geometry comparison
+    gpio check bbox myfile.parquet --sample-rows 50000
+    gpio check bbox myfile.parquet --all-rows
     ```
 
 === "Python"
@@ -600,6 +741,10 @@ Validates STAC Item or Collection JSON:
     ```python
     # Custom sampling for spatial check
     result = table.check_spatial(sample_size=200, limit_rows=1000000)
+
+    # Custom sampling for the bbox-vs-geometry comparison
+    result = table.check_bbox(sample_rows=50000)
+    result = table.check_bbox(all_rows=True)
     ```
 
 ## Checking Partitioned Data

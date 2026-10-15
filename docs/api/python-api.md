@@ -1445,6 +1445,23 @@ row_group_result = table.check_row_groups()
 details = result.to_dict()
 ```
 
+`check_bbox()` also compares each row's bbox against its geometry's real
+envelope. A bbox smaller than its geometry fails the check — readers prune on
+the covering, so those rows go missing from spatial query results with no error
+anywhere — as do a NULL or NaN bbox and a geometry that is not valid WKB; one
+larger than its geometry is a warning (`verdict()` is `"warning"`). The
+comparison decodes a seeded sample of 5,000 rows drawn across the file by
+default, though it reads the geometry and bbox columns in full:
+
+```python
+bbox_result = table.check_bbox(all_rows=True)       # compare every row
+bbox_result = table.check_bbox(sample_rows=50000)   # wider sample
+bbox_result = table.check_bbox(sample_rows=0)       # structure and metadata only
+
+report = table.check_bbox().to_dict()['bbox_values']
+print(report['undersized_rows'], report['undersized_examples'])
+```
+
 **Which bytes a check describes.** A table from `gpio.read(path)` is checked
 against that file, so `table.check_compression()` and `gpio check compression
 <path>` give the same verdict. A table built in memory, read with `columns=` or
