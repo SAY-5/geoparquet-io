@@ -1311,21 +1311,45 @@ def _geojson_page_to_table(features: list[dict], con=None) -> pa.Table | None:
     )
 
 
+def _prepare_esrijson_for_gdal(page: dict) -> dict:
+    """Return a shallow copy of an EsriJSON page with `features` moved last.
+
+    GDAL identifies the format from the beginning of the file. When a large
+    `features` array comes before `geometryType`, it picks the GeoJSON driver
+    and fails to read the Esri-shaped features (issue #501).
+
+    `geometryType` goes first, `features` goes last, and every other member
+    keeps its original order. Which members GDAL treats as ESRIJSON markers is
+    GDAL's business (`fields` and `fieldAliases` count too), so none of them is
+    moved ahead of another: apart from the few bytes `geometryType` adds in
+    front, no member other than `features` starts later than it did in `page`.
+    Values are shared with `page`, which is left unchanged.
+    """
+    prepared = {"geometryType": page["geometryType"]} if "geometryType" in page else {}
+    prepared.update(page)
+    if "features" in prepared:
+        prepared["features"] = prepared.pop("features")
+    return prepared
+
+
 def _esrijson_page_to_table(page: dict, con=None) -> pa.Table | None:
     """Convert a page of EsriJSON features to a PyArrow Table with WKB geometry.
 
     Unlike GeoJSON, GDAL's ESRIJSON driver needs the whole response object
-    (geometryType / spatialReference / fields / features), so the raw page is
-    written verbatim. `attributes` are flattened to columns by the driver.
-    GDAL may or may not add OGC_FID for EsriJSON; extra columns are kept here
-    and dropped later by _cast_table_to_schema.
+    (geometryType / spatialReference / fields / features), so the page is
+    written whole, with `geometryType` first and `features` last so GDAL
+    recognizes it whatever order the server used. `attributes` are flattened
+    to columns by the driver. GDAL may or may not add OGC_FID for EsriJSON;
+    extra columns are kept here and dropped later by _cast_table_to_schema.
 
     Returns a PyArrow Table with WKB geometry column, or None if no features.
     """
     if not page.get("features"):
         return None
 
-    return _json_doc_to_table(page, exclude="geom", suffix=".json", con=con)
+    return _json_doc_to_table(
+        _prepare_esrijson_for_gdal(page), exclude="geom", suffix=".json", con=con
+    )
 
 
 def _stream_features_to_parquet(
