@@ -214,8 +214,11 @@ from geoparquet_io.core import (  # noqa: E402
 from geoparquet_io.core.write_strategies import WriteStrategyFactory  # noqa: E402
 
 PACKAGE_CACHES = (
+    crs_utils._canonical_projjson,
     crs_utils._emit_crs_disagreement_warning,
+    crs_utils._emit_ignored_crs_id_warning,
     crs_utils._emit_null_crs_warning,
+    crs_utils._free_form_source,
     crs_utils._projjson_from_authority,
     file_type.detect_geoparquet_file_type,
     geo_metadata._emit_malformed_geo_warning,

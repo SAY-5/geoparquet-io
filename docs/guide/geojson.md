@@ -436,6 +436,39 @@ gpio convert reproject data.parquet - --dst-crs EPSG:4326 | \
     )
     ```
 
+### How the source CRS is read
+
+GeoJSON output is lon/lat (RFC 7946), so gpio reprojects any other input CRS first. It reads the CRS from the `geo` metadata, or from the Parquet GEOMETRY type when there is no `geo` block, and the same rules apply to a file, a stream on stdin and a Python `Table`.
+
+| Input CRS | What gpio does |
+|-----------|----------------|
+| Absent, `OGC:CRS84` or `EPSG:4326` | Writes coordinates as they are |
+| A plain lon/lat WGS 84 string such as `WGS84` or `+proj=longlat +datum=WGS84 +no_defs` | Writes coordinates as they are |
+| A compound CRS over lon/lat WGS 84, such as `EPSG:4326+5773` | Writes coordinates as they are |
+| Another name or PROJ string, such as `NAD83`, `Tokyo` or `+proj=longlat +ellps=GRS80` | Reprojects from the code PROJ matches exactly, or else from the definition PROJ reads |
+| Has an authority code PROJ knows (`EPSG:32631`) | Reprojects from that code |
+| PROJJSON or WKT with no authority code (a custom Transverse Mercator) | Reprojects from the definition itself |
+| An `id` that is malformed or that PROJ does not know, next to a valid definition | Warns once and reprojects from the definition |
+| A PROJ string with an `init=` parameter | Fails without reading the file it names |
+| Anything PROJ cannot read | Fails and asks for an explicit source CRS |
+
+`--keep-crs` skips all of this and writes the input coordinates unchanged. When the CRS cannot be read, reproject with an explicit source CRS first:
+
+=== "CLI"
+
+    ```bash
+    gpio convert reproject data.parquet fixed.parquet --src-crs EPSG:3857
+    gpio convert geojson fixed.parquet out.geojson
+    ```
+
+=== "Python"
+
+    ```python
+    import geoparquet_io as gpio
+
+    gpio.read("data.parquet").reproject(source_crs="EPSG:3857").to_geojson("out.geojson")
+    ```
+
 ## Writing to File
 
 To write a standard GeoJSON FeatureCollection, specify an output file:
