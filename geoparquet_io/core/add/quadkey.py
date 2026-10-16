@@ -22,6 +22,7 @@ from geoparquet_io.core.duckdb_metadata import get_column_names, get_geo_metadat
 from geoparquet_io.core.duckdb_utils import (
     get_duckdb_connection,
     quote_identifier,
+    register_arrow,
     sql_path,
     uses_aws_profile,
 )
@@ -31,6 +32,7 @@ from geoparquet_io.core.geometry_detection import (
     STANDARD_GEOMETRY_NAMES,
     find_primary_geometry_column,
 )
+from geoparquet_io.core.geometry_repair import warn_planar_math, warn_planar_math_for_file
 from geoparquet_io.core.logging_config import (
     configure_verbose,
     debug,
@@ -263,7 +265,8 @@ def add_quadkey_table(
             "VARCHAR",
         )
 
-        con.register("__input_table", table)
+        warn_planar_math("add_quadkey", table, geom_col)
+        registered = register_arrow(con, "__input_table", table)
 
         # Check if geometry column is BLOB (needs conversion)
         columns_info = con.execute("DESCRIBE __input_table").fetchall()
@@ -320,6 +323,7 @@ def add_quadkey_table(
         if table.schema.metadata:
             result = result.replace_schema_metadata(table.schema.metadata)
 
+        result = registered.restore_edges(result)
         return result
 
 
@@ -372,6 +376,8 @@ def add_quadkey_column(
         hive_input: Read a multi-file input with hive partitioning on, so the
             ``key=value`` directory names come through as columns
     """
+    warn_planar_math_for_file("add_quadkey", input_parquet)
+
     # Check for streaming mode (stdin input or stdout output)
     is_streaming = is_stdin(input_parquet) or should_stream_output(output_parquet)
 

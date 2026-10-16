@@ -36,6 +36,7 @@ from geoparquet_io.core.duckdb_utils import (
     _escape_sql_string,
     get_duckdb_connection,
     quote_identifier,
+    register_arrow,
     sql_path,
     uses_aws_profile,
 )
@@ -47,6 +48,7 @@ from geoparquet_io.core.geo_metadata import (
     strip_derived_stats,
 )
 from geoparquet_io.core.geometry_detection import find_primary_geometry_column
+from geoparquet_io.core.geometry_repair import warn_planar_math, warn_planar_math_for_file
 from geoparquet_io.core.logging_config import debug, info, success, warn
 from geoparquet_io.core.remote import (
     needs_httpfs,
@@ -260,7 +262,8 @@ def reproject_table(
     # Create connection and register table
     con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
     try:
-        con.register("__input_table", table)
+        warn_planar_math("reproject", table, geom_col)
+        register_arrow(con, "__input_table", table)
 
         # Check if geometry column is BLOB type (needs conversion to GEOMETRY)
         geom_is_blob = False
@@ -561,6 +564,7 @@ def reproject_impl(
     try:
         # Detect geometry column
         geom_col = find_primary_geometry_column(read_source, verbose=verbose)
+        warn_planar_math_for_file("reproject", read_source, geom_col)
         log(f"Geometry column: {geom_col}")
 
         # An explicit --src-crs wins without reading the file's CRS, so it also
@@ -812,6 +816,7 @@ def _reproject_streaming(
         try:
             # Detect geometry column
             geom_col = find_primary_geometry_column(working_file, verbose=False)
+            warn_planar_math_for_file("reproject", working_file, geom_col)
 
             # Detect source CRS
             effective_source_crs = (
