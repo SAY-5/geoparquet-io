@@ -42,6 +42,7 @@ from geoparquet_io.core.crs_utils import (
     extract_crs_from_parquet,
     get_crs_display_name,
     is_geographic_crs,
+    is_unknown_type_crs,
     parse_crs_string_to_projjson,
 )
 from geoparquet_io.core.derive_geo_from_file import (
@@ -117,7 +118,11 @@ from geoparquet_io.core.write_strategies import (
     WriteStrategyFactory,
     needs_metadata_rewrite,
 )
-from geoparquet_io.core.write_strategies.base import merge_secondary_geometry_metadata
+from geoparquet_io.core.write_strategies.base import (
+    has_unknown_secondary,
+    merge_secondary_geometry_metadata,
+    wrap_query_with_secondary_crs,
+)
 
 
 def collect_nonplanar_edges(input_file: str) -> dict[str, str]:
@@ -559,6 +564,7 @@ def _plain_copy_to(
     extra_kv_metadata: dict[str, str] | None = None,
     memory_limit: str | None = None,
     defer_v2_geo_repair: bool = False,
+    secondary_geo_columns: dict | None = None,
 ) -> dict | None:
     """
     Execute a plain DuckDB COPY TO without geo metadata manipulation.
@@ -600,6 +606,8 @@ def _plain_copy_to(
             instead of patching it here, because the caller is about to patch
             the same footer for non-planar edges and one ``patch_footer`` call
             can carry both (#1270).
+        secondary_geo_columns: The ``geo.columns`` entries the secondaries'
+            CRS comes from, so a 2.0 type carries each one's own CRS.
 
     Returns:
         The repair's pending ``geo`` block when ``defer_v2_geo_repair`` asked
@@ -622,7 +630,10 @@ def _plain_copy_to(
 
     # DuckDB 1.5+: Apply CRS via ST_SetCRS so it's written natively into the
     # Parquet schema during COPY TO — no post-processing file rewrite needed.
-    final_query = _wrap_query_with_crs(query, geometry_column, input_crs)
+    final_query = _wrap_query_with_crs(query, geometry_column, input_crs, geoparquet_version)
+    final_query = wrap_query_with_secondary_crs(
+        con, final_query, secondary_geo_columns, geometry_column, geoparquet_version
+    )
 
     # Build options list
     options = [
@@ -998,9 +1009,12 @@ def _fast_path_geo_decision(
     Both answers are ``(None, False)`` — "let DuckDB write its own block on the
     fast path" — when the version is not 2.0 (1.x already rewrites), when the
     input resolves to more than one file (see below), or when the carried block
-    says nothing DuckDB would not write itself.
+    says nothing DuckDB would not write itself. The one exception is an unknown
+    ``input_crs`` with no carried block to state it: DuckDB's block would omit
+    ``crs`` and so claim OGC:CRS84, so that write is sent to the rewrite
+    (``(None, True)``, #1276).
 
-    The second answer is ``True`` only when the block IS worth keeping and still
+    Otherwise the second answer is ``True`` only when the block IS worth keeping and still
     cannot be written verbatim, because a caller invalidated the derived stats and
     nothing here can recompute them. The fast path cannot merge: it replaces
     DuckDB's whole ``geo`` key with what this returns, so a block missing
@@ -1014,8 +1028,14 @@ def _fast_path_geo_decision(
     gate is: until that step has run, there is no telling whether the block has
     anything the fast path would lose.
     """
-    if effective_version != "2.0" or not geometry_column or not original_metadata:
+    if effective_version != "2.0" or not geometry_column:
         return None, False
+    # DuckDB's own 2.0 block omits `crs`, which reads as OGC:CRS84. An unknown
+    # CRS with no carried block to say so takes the rewrite, which writes
+    # `crs: null` (#1276).
+    no_block = (None, is_unknown_type_crs(input_crs))
+    if not original_metadata:
+        return no_block
 
     # A glob/directory input merges several files, but `original_metadata` was
     # read from the FIRST file's footer only. Carrying its bbox/geometry_types
@@ -1028,7 +1048,7 @@ def _fast_path_geo_decision(
                 "Not carrying the input's geo block: a multi-file input's merged "
                 "stats cannot come from the first file's footer"
             )
-        return None, False
+        return no_block
 
     # A write-path reader in the strongest sense: whatever comes back is written
     # to the output file verbatim, so the block goes through the shared shape
@@ -1036,10 +1056,10 @@ def _fast_path_geo_decision(
     # `'list' object has no attribute 'get'` on the next line (#947).
     geo_dict = sanitized_carried_geo(original_metadata)
     if not geo_dict:
-        return None, False
+        return no_block
     col_meta = (geo_dict.get("columns") or {}).get(geometry_column)
     if not isinstance(col_meta, dict):
-        return None, False
+        return no_block
     carried = copy.deepcopy(geo_dict)
     carried["version"] = "2.0.0"
     # Before the gate: a block whose only extra key was a default or null
@@ -1138,6 +1158,30 @@ def _query_geometry_is_already_native(con, query: str, geometry_column: str | No
     col_type = _get_query_column_type(con, query, geometry_column)
     return bool(col_type) and not col_type.upper().startswith(
         ("GEOMETRY", "GEOGRAPHY", "BLOB", "VARCHAR")
+    )
+
+
+def _secondary_geo_columns(carried_geo_block: dict | None, geometry_info: dict | None):
+    """The ``geo.columns`` entries the write's secondary CRS comes from."""
+    return (carried_geo_block or {}).get("columns") or (geometry_info or {}).get("metadata")
+
+
+def _unknown_secondary_needs_rewrite(
+    carried_geo_block: dict | None,
+    secondary_geo_columns: dict | None,
+    geometry_column: str | None,
+    effective_version: str,
+) -> bool:
+    """Whether an unknown secondary CRS sends a 2.0 fast-path write to the rewrite.
+
+    DuckDB's own 2.0 block omits the ``crs`` of a ``srid:0`` column, which reads
+    as OGC:CRS84. With no carried block to say ``crs: null`` for an unknown
+    secondary, the rewrite writes it (#1277 review).
+    """
+    return (
+        carried_geo_block is None
+        and effective_version == "2.0"
+        and has_unknown_secondary(secondary_geo_columns, geometry_column)
     )
 
 
@@ -1393,6 +1437,10 @@ def write_parquet_with_metadata(
         # DuckDB instead. Merged after the "says more than DuckDB" gate, so a
         # secondary's own `crs` cannot by itself make a block worth carrying.
         merge_secondary_geometry_metadata(carried_geo_block, geometry_info)
+    secondary_geo_columns = _secondary_geo_columns(carried_geo_block, geometry_info)
+    rewrite_needed = rewrite_needed or _unknown_secondary_needs_rewrite(
+        carried_geo_block, secondary_geo_columns, geometry_column, effective_version
+    )
 
     # Preserve non-geo KV metadata from input (e.g., vecorel, fiboa).
     # Build a merged local dict rather than mutating the caller-supplied
@@ -1467,6 +1515,7 @@ def write_parquet_with_metadata(
                 # An edges patch is coming: one patch_footer call carries the
                 # M/ZM geo repair and the retype together (#1270).
                 defer_v2_geo_repair=bool(edges_to_restore),
+                secondary_geo_columns=secondary_geo_columns,
             )
         else:
             pending_v2_geo = None

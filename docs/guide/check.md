@@ -601,9 +601,42 @@ Validates file structure and metadata against the GeoParquet specification:
   `v2_crs_consistency`, because the Parquet type's own default is OGC:CRS84.
   The spec's pairing for an unknown CRS is `"crs": null` in the geo metadata
   *and* the string `srid:0` in the Parquet logical type; written that way, the
-  file passes. If the coordinates really are lon/lat WGS84, drop the null
-  instead: `gpio convert reproject in.parquet out.parquet --assume-crs84`
+  file passes. Every gpio write keeps an unknown CRS unknown. GeoParquet 1.0
+  and 1.1 outputs keep `"crs": null`, 2.0 outputs keep it and type the column
+  `srid:0`, and parquet-geo-only outputs type the column `srid:0`. An empty
+  `crs` value such as `{}` is read as unknown too, with a warning, and written
+  the same way. So is a `srid:0` type under a geo entry with no `crs` key,
+  which is how DuckDB's own 2.0 writer spells an unknown CRS. Secondary
+  geometry columns follow the same rules. An unknown CRS has no valid
+  coordinate range, so `coordinates_valid_for_crs` is skipped for it instead
+  of holding projected coordinates to the lon/lat range. If you know the real
+  CRS, `gpio convert reproject in.parquet out.parquet --src-crs EPSG:5070`
+  reprojects from it. If the coordinates really are lon/lat WGS84, drop the
+  null instead. `gpio convert reproject in.parquet out.parquet --assume-crs84`
   writes the default (see [convert](../cli/convert.md)).
+
+  === "CLI"
+
+      ```bash
+      # You know the real CRS, so reproject from it
+      gpio convert reproject input.parquet out.parquet --src-crs EPSG:5070
+
+      # The coordinates really are lon/lat WGS84
+      gpio convert reproject input.parquet out_crs84.parquet --assume-crs84
+      ```
+
+  === "Python"
+
+      <!-- doctest: prelude="import geoparquet_io as gpio" -->
+      ```python
+      table = gpio.read("input.parquet")
+
+      # You know the real CRS, so reproject from it
+      table.reproject(target_crs="EPSG:4326", source_crs="EPSG:5070").write("out.parquet")
+
+      # The coordinates really are lon/lat WGS84
+      table.reproject(target_crs="EPSG:4326", assume_crs84=True).write("out_crs84.parquet")
+      ```
 - **Every CRS form the Parquet geo type may use** — the `GEOMETRY`/`GEOGRAPHY`
   logical type can name its CRS as inline PROJJSON, `srid:<id>`,
   `projjson:<key>` or the compact `<authority>:<code>` (e.g. `EPSG:32633`), and

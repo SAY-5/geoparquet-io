@@ -29,7 +29,7 @@ from geoparquet_io.core.arrow_geo_metadata import (
     table_geometry_info,
 )
 from geoparquet_io.core.crs_utils import _wrap_query_with_crs as _common_wrap_query_with_crs
-from geoparquet_io.core.crs_utils import is_default_crs
+from geoparquet_io.core.crs_utils import is_default_crs, is_unknown_type_crs
 from geoparquet_io.core.duckdb_utils import (
     _escape_sql_string,
     _wrap_query_with_blob_conversion,
@@ -39,6 +39,7 @@ from geoparquet_io.core.duckdb_utils import (
     validate_compression_level,
 )
 from geoparquet_io.core.geo_metadata import (
+    NATIVE_GEOMETRY_VERSIONS,
     compute_geo_stats_via_sql,
     declare_carried_bbox_column,
     gate_illegal_bbox_covering,
@@ -52,6 +53,8 @@ from geoparquet_io.core.write_strategies.base import (
     BaseWriteStrategy,
     build_geo_metadata,
     resolve_geometry_columns,
+    type_crs_for,
+    wrap_query_with_secondary_crs,
 )
 from geoparquet_io.core.write_strategies.row_group_sizing import _resolve_row_group_rows
 
@@ -62,11 +65,35 @@ VALID_COMPRESSIONS = frozenset({"ZSTD", "SNAPPY", "GZIP", "LZ4", "UNCOMPRESSED",
 def _wrap_query_with_crs(
     query: str,
     geometry_column: str,
-    input_crs: dict | None,
+    input_crs: dict | str | None,
+    geoparquet_version: str | None = None,
 ) -> str:
-    """Wrap query with ST_SetCRS() — delegates to shared helper in common.py."""
+    """Wrap query with ST_SetCRS() — delegates to the shared helper in crs_utils."""
 
-    return _common_wrap_query_with_crs(query, geometry_column, input_crs)
+    return _common_wrap_query_with_crs(query, geometry_column, input_crs, geoparquet_version)
+
+
+def _native_typed_query(
+    con: duckdb.DuckDBPyConnection,
+    query: str,
+    geometry_column: str,
+    geo_meta: dict,
+    input_crs: dict | str | None,
+    geoparquet_version: str,
+) -> str:
+    """``query`` with every geometry column typed with the CRS ``geo_meta`` gives it.
+
+    The block built for the output is the answer for the type too, at 2.0 and
+    at parquet-geo-only alike: a column it calls unknown is typed ``srid:0``,
+    never left bare (#1276), and each secondary gets its own CRS (#1277 review).
+    """
+    columns = geo_meta.get("columns") or {}
+    type_crs = input_crs
+    primary_type_crs = type_crs_for(columns.get(geometry_column))
+    if is_unknown_type_crs(primary_type_crs):
+        type_crs = primary_type_crs
+    typed = _wrap_query_with_crs(query, geometry_column, type_crs, geoparquet_version)
+    return wrap_query_with_secondary_crs(con, typed, columns, geometry_column, geoparquet_version)
 
 
 def _plain_wkb_for_secondary_columns(
@@ -115,14 +142,15 @@ def _table_query_with_native_geometry(
 
     At 2.0 the same goes for a secondary the table's carried ``geo`` key declares
     as plain WKB bytes: left a BLOB, it is described in ``geo.columns`` but not
-    natively typed, which 2.0 requires of every geometry column (#1175). It gets
-    its own declared CRS, never the primary's. parquet-geo-only writes no block,
-    so the native type is a secondary's only geometry identity there too. Below
-    2.0 the secondaries stay WKB and the write path's blob conversion handles them.
+    natively typed, which 2.0 requires of every geometry column (#1175). The
+    same holds at parquet-geo-only, where the type is the column's only geometry
+    identity. It gets its own declared CRS, never the primary's, and ``srid:0``
+    when that CRS is unknown (#1277 review). Below 2.0 the secondaries stay WKB
+    and the write path's blob conversion handles them.
     """
     replacements = []
     columns = [geometry_column]
-    if geoparquet_version in ("2.0", "parquet-geo-only"):
+    if geoparquet_version in NATIVE_GEOMETRY_VERSIONS:
         columns += list((geometry_info or {}).get("secondary") or ())
     metadata = (geometry_info or {}).get("metadata") or {}
     for name in columns:
@@ -140,8 +168,10 @@ def _table_query_with_native_geometry(
             continue
         ident = quote_identifier(name)
         expr = f"ST_GeomFromWKB({ident})"
-        crs = (metadata.get(name) or {}).get("crs") if name != geometry_column else None
-        if isinstance(crs, dict) and not is_default_crs(crs):
+        crs = type_crs_for(metadata.get(name)) if name != geometry_column else None
+        if is_unknown_type_crs(crs):
+            expr = f"ST_SetCRS({expr}, '{_escape_sql_string(crs)}')"
+        elif isinstance(crs, dict) and crs and not is_default_crs(crs):
             expr = f"ST_SetCRS({expr}, '{_escape_sql_string(json.dumps(crs))}')"
         replacements.append(f"{expr} AS {ident}")
     if not replacements:
@@ -271,6 +301,8 @@ class DuckDBKVStrategy(BaseWriteStrategy):
                         output_path,
                         verbose,
                         extra_kv_metadata=extra_kv_metadata,
+                        original_metadata=original_metadata,
+                        geometry_info=geometry_info,
                     )
                 else:
                     self._write_with_geo_metadata(
@@ -334,15 +366,28 @@ class DuckDBKVStrategy(BaseWriteStrategy):
         output_path: str,
         verbose: bool,
         extra_kv_metadata: dict[str, str] | None = None,
+        original_metadata: dict | None = None,
+        geometry_info: dict | None = None,
     ) -> None:
         """Write parquet-geo-only format (no geo metadata)."""
         if verbose:
             debug("Writing parquet-geo-only (no geo metadata)...")
 
-        # DuckDB 1.5+: Keep native GEOMETRY type — DuckDB writes native Parquet
-        # geometry encoding directly. No WKB conversion needed.
-        # Apply CRS via ST_SetCRS so DuckDB writes it into the schema natively.
-        final_query = _wrap_query_with_crs(query, geometry_column, input_crs)
+        # DuckDB 1.5+: Keep native GEOMETRY type, which DuckDB writes as native
+        # Parquet geometry directly. The type is each column's only CRS here, so
+        # the block is still built, never written, to type every geometry column
+        # the way a 2.0 write does. Typing the primary alone left an unknown
+        # secondary unset, which reads as OGC:CRS84 (#1277 review).
+        geo_meta = build_geo_metadata(
+            geometry_column=geometry_column,
+            geoparquet_version="parquet-geo-only",
+            original_metadata=original_metadata,
+            input_crs=input_crs,
+            geometry_info=geometry_info,
+        )
+        final_query = _native_typed_query(
+            con, query, geometry_column, geo_meta, input_crs, "parquet-geo-only"
+        )
 
         copy_options = _build_copy_options(
             compression,
@@ -417,7 +462,9 @@ class DuckDBKVStrategy(BaseWriteStrategy):
                 query, geometry_column, con, secondary_columns=sorted(secondary_columns)
             )
         else:
-            final_query = _wrap_query_with_crs(query, geometry_column, input_crs)
+            final_query = _native_typed_query(
+                con, query, geometry_column, geo_meta, input_crs, geoparquet_version
+            )
 
         copy_options = _build_copy_options(
             compression, row_group_rows, json.dumps(geo_meta), extra_kv_metadata, compression_level
