@@ -2273,6 +2273,10 @@ def convert_to_geopackage(
     output_path: str,
     overwrite: bool = False,
     layer_name: str = "features",
+    bbox: str | tuple[float, float, float, float] | None = None,
+    geometry: str | None = None,
+    where: str | None = None,
+    use_first_geometry: bool = False,
 ) -> str:
     """
     Convert a GeoParquet table to GeoPackage format.
@@ -2284,6 +2288,13 @@ def convert_to_geopackage(
         output_path: Output file path (must be local, not cloud URL)
         overwrite: Overwrite existing file (default: False)
         layer_name: Layer name in GeoPackage (default: 'features')
+        bbox: Bounding box filter, (xmin, ymin, xmax, ymax) or
+            "xmin,ymin,xmax,ymax"; prunes on the bbox covering column when
+            the table has one
+        geometry: Geometry filter: GeoJSON or WKT text, or @filepath
+        where: DuckDB WHERE clause for filtering rows
+        use_first_geometry: Use the first geometry when ``geometry`` is a
+            FeatureCollection with several
 
     Returns:
         Output path
@@ -2297,12 +2308,20 @@ def convert_to_geopackage(
         "geopackage",
         overwrite=overwrite,
         layer_name=layer_name,
+        bbox=bbox,
+        geometry=geometry,
+        where=where,
+        use_first_geometry=use_first_geometry,
     )
 
 
 def convert_to_flatgeobuf(
     table: pa.Table,
     output_path: str,
+    bbox: str | tuple[float, float, float, float] | None = None,
+    geometry: str | None = None,
+    where: str | None = None,
+    use_first_geometry: bool = False,
 ) -> str:
     """
     Convert a GeoParquet table to FlatGeobuf format.
@@ -2312,6 +2331,12 @@ def convert_to_flatgeobuf(
     Args:
         table: Input PyArrow Table with geometry column
         output_path: Output file path (must be local, not cloud URL)
+        bbox: Bounding box filter, (xmin, ymin, xmax, ymax) or
+            "xmin,ymin,xmax,ymax"
+        geometry: Geometry filter: GeoJSON or WKT text, or @filepath
+        where: DuckDB WHERE clause for filtering rows
+        use_first_geometry: Use the first geometry when ``geometry`` is a
+            FeatureCollection with several
 
     Returns:
         Output path
@@ -2323,6 +2348,10 @@ def convert_to_flatgeobuf(
         output_path,
         write_flatgeobuf,
         "flatgeobuf",
+        bbox=bbox,
+        geometry=geometry,
+        where=where,
+        use_first_geometry=use_first_geometry,
     )
 
 
@@ -2331,6 +2360,10 @@ def convert_to_csv(
     output_path: str,
     include_wkt: bool = True,
     include_bbox: bool = True,
+    bbox: str | tuple[float, float, float, float] | None = None,
+    geometry: str | None = None,
+    where: str | None = None,
+    use_first_geometry: bool = False,
 ) -> str:
     """
     Convert a GeoParquet table to CSV format.
@@ -2343,6 +2376,12 @@ def convert_to_csv(
         output_path: Output file path (must be local, not cloud URL)
         include_wkt: Include WKT geometry column (default: True)
         include_bbox: Include bbox column if present (default: True)
+        bbox: Bounding box filter, (xmin, ymin, xmax, ymax) or
+            "xmin,ymin,xmax,ymax"
+        geometry: Geometry filter: GeoJSON or WKT text, or @filepath
+        where: DuckDB WHERE clause for filtering rows
+        use_first_geometry: Use the first geometry when ``geometry`` is a
+            FeatureCollection with several
 
     Returns:
         Output path
@@ -2356,6 +2395,10 @@ def convert_to_csv(
         "csv",
         include_wkt=include_wkt,
         include_bbox=include_bbox,
+        bbox=bbox,
+        geometry=geometry,
+        where=where,
+        use_first_geometry=use_first_geometry,
     )
 
 
