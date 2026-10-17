@@ -40,7 +40,10 @@ from geoparquet_io.core.str_order import DEFAULT_STR_TILE_SIZE, str_order_table
 from geoparquet_io.core.wfs import DEFAULT_WFS_PAGE_SIZE
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
+
+    from geoparquet_io.core.preview import BboxFilterPreview
 
 
 def add_bbox(
@@ -2759,6 +2762,56 @@ def get_row_group_geo_stats(parquet_file: str) -> list[dict]:
     num_rows_per_rg = _get_num_rows_per_row_group(parquet_file, file_meta)
 
     return _merge_row_counts(rg_stats, num_rows_per_rg)
+
+
+def preview_bbox_filter(
+    parquet_file: str,
+    bbox: Sequence[float],
+    geometry_column: str | None = None,
+) -> BboxFilterPreview:
+    """
+    Preview the row groups a bbox-filtered read would touch, before reading.
+
+    Answers from the Parquet footer alone: which row groups can match the
+    query bbox, and how many rows and compressed bytes those groups hold --
+    a real denominator for a progress bar, or a size warning before a large
+    download. The estimate comes from per-row-group spatial statistics
+    (native Parquet geo statistics, or a bbox covering column's chunk
+    statistics); a file with neither gets an explicit "no estimate", never
+    a guess.
+
+    Args:
+        parquet_file: Path or URL of the (Geo)Parquet file
+        bbox: Query bounds as (xmin, ymin, xmax, ymax) in the file's CRS
+        geometry_column: Geometry column whose native statistics to read
+            (auto-detected if None)
+
+    Returns:
+        A ``BboxFilterPreview`` (from ``geoparquet_io.core.preview``) with
+        ``has_estimate``, ``reason``, ``stats_source``, ``row_groups``
+        (row_group_id, num_rows, compressed_bytes each), ``est_rows``,
+        ``est_bytes`` and the file's ``total_row_groups`` / ``total_rows`` /
+        ``total_bytes``. Check ``has_estimate`` before using the estimates.
+
+    Raises:
+        InvalidParameterError: If ``bbox`` is not four finite numbers with
+            xmin <= xmax and ymin <= ymax, or if ``geometry_column`` names
+            a column the file does not have.
+
+    Example:
+        >>> from geoparquet_io.api import ops
+        >>> preview = ops.preview_bbox_filter(
+        ...     'https://example.com/places.parquet',
+        ...     bbox=(-122.5, 37.7, -122.3, 37.9),
+        ... )
+        >>> if preview.has_estimate:
+        ...     print(f"~{preview.est_rows} rows, ~{preview.est_bytes} bytes")
+        ... else:
+        ...     print(f"no estimate: {preview.reason}")
+    """
+    from geoparquet_io.core.preview import preview_bbox_filter as _preview_bbox_filter
+
+    return _preview_bbox_filter(parquet_file, bbox, geometry_column=geometry_column)
 
 
 def compression_stats(path: str) -> list[dict]:
